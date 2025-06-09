@@ -95,17 +95,26 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             )
 
         elif self.bucket_type == BlobType.S3:
-            if not all(
-                credentials.get(key)
-                for key in ["aws_access_key_id", "aws_secret_access_key"]
-            ):
-                raise ConnectorMissingCredentialError("Amazon S3")
+            # Original code:
+            # if not all(
+            #     credentials.get(key)
+            #     for key in ["aws_access_key_id", "aws_secret_access_key"]
+            # ):
+            #     raise ConnectorMissingCredentialError("Amazon S3")
 
-            session = boto3.Session(
-                aws_access_key_id=credentials["aws_access_key_id"],
-                aws_secret_access_key=credentials["aws_secret_access_key"],
-            )
-            self.s3_client = session.client("s3")
+            # session = boto3.Session(
+            #     aws_access_key_id=credentials["aws_access_key_id"],
+            #     aws_secret_access_key=credentials["aws_secret_access_key"],
+            # )
+            # self.s3_client = session.client("s3")
+            
+            # FORCE INSTANCE PROFILE: Ignore any provided AWS credentials
+            # aws_access_key_id = credentials.get("aws_access_key_id")  # IGNORED
+            # aws_secret_access_key = credentials.get("aws_secret_access_key")  # IGNORED
+            
+            # Always use EC2 instance profile
+            region = credentials.get("region", "us-east-1")
+            self.s3_client = boto3.client("s3", region_name=region)
 
         elif self.bucket_type == BlobType.GOOGLE_CLOUD_STORAGE:
             if not all(
