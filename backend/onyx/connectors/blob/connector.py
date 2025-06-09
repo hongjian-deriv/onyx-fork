@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 from datetime import timezone
 from io import BytesIO
@@ -7,9 +8,11 @@ from typing import Optional
 
 import boto3  # type: ignore
 from botocore.client import Config  # type: ignore
+from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import ClientError
 from botocore.exceptions import NoCredentialsError
 from botocore.exceptions import PartialCredentialsError
+from botocore.session import get_session
 from mypy_boto3_s3 import S3Client  # type: ignore
 
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
@@ -61,7 +64,7 @@ class BlobStorageConnector(LoadConnector, PollConnector):
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         """Checks for boto3 credentials based on the bucket type.
         (1) R2: Access Key ID, Secret Access Key, Account ID
-        (2) S3: AWS Access Key ID, AWS Secret Access Key
+        (2) S3: AWS Access Key ID, AWS Secret Access Key or IAM role
         (3) GOOGLE_CLOUD_STORAGE: Access Key ID, Secret Access Key, Project ID
         (4) OCI_STORAGE: Namespace, Region, Access Key ID, Secret Access Key
 
@@ -95,26 +98,70 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             )
 
         elif self.bucket_type == BlobType.S3:
-            # Original code:
-            # if not all(
-            #     credentials.get(key)
-            #     for key in ["aws_access_key_id", "aws_secret_access_key"]
-            # ):
-            #     raise ConnectorMissingCredentialError("Amazon S3")
+            # For S3, we can use access keys, IAM roles, or EC2 instance profiles.
+            # FORCE INSTANCE PROFILE: Override any authentication method from frontend
+            authentication_method = "instance_profile"  # Always force this
+            logger.debug("FORCED: Using instance profile authentication for S3 bucket.")
 
-            # session = boto3.Session(
-            #     aws_access_key_id=credentials["aws_access_key_id"],
-            #     aws_secret_access_key=credentials["aws_secret_access_key"],
-            # )
-            # self.s3_client = session.client("s3")
-            
-            # FORCE INSTANCE PROFILE: Ignore any provided AWS credentials
-            # aws_access_key_id = credentials.get("aws_access_key_id")  # IGNORED
-            # aws_secret_access_key = credentials.get("aws_secret_access_key")  # IGNORED
-            
-            # Always use EC2 instance profile
-            region = credentials.get("region", "us-east-1")
-            self.s3_client = boto3.client("s3", region_name=region)
+            if authentication_method == "access_key":
+                # Keep upstream logic (never reached due to forced override)
+                logger.debug("Using access key authentication for S3 bucket.")
+                if not all(
+                    credentials.get(key)
+                    for key in ["aws_access_key_id", "aws_secret_access_key"]
+                ):
+                    raise ConnectorMissingCredentialError("Amazon S3")
+
+                session = boto3.Session(
+                    aws_access_key_id=credentials["aws_access_key_id"],
+                    aws_secret_access_key=credentials["aws_secret_access_key"],
+                )
+                self.s3_client = session.client("s3")
+            elif authentication_method == "iam_role":
+                # Keep upstream logic (never reached due to forced override)
+                logger.debug("Using IAM role authentication for S3 bucket.")
+                # If using IAM roles, we assume the role and let boto3 handle the credentials.
+                role_arn = credentials.get("aws_role_arn")
+                # create session name using timestamp
+                if not role_arn:
+                    raise ConnectorMissingCredentialError(
+                        "Amazon S3 IAM role ARN is required for assuming role."
+                    )
+
+                def _refresh_credentials() -> dict[str, str]:
+                    """Refreshes the credentials for the assumed role."""
+                    sts_client = boto3.client("sts")
+                    assumed_role_object = sts_client.assume_role(
+                        RoleArn=role_arn,
+                        RoleSessionName=f"onyx_blob_storage_{int(time.time())}",
+                    )
+                    creds = assumed_role_object["Credentials"]
+                    return {
+                        "access_key": creds["AccessKeyId"],
+                        "secret_key": creds["SecretAccessKey"],
+                        "token": creds["SessionToken"],
+                        "expiry_time": creds["Expiration"].isoformat(),
+                    }
+
+                refreshable = RefreshableCredentials.create_from_metadata(
+                    metadata=_refresh_credentials(),
+                    refresh_using=_refresh_credentials,
+                    method="sts-assume-role",
+                )
+                botocore_session = get_session()
+                botocore_session._credentials = refreshable  # type: ignore[attr-defined]
+                session = boto3.Session(botocore_session=botocore_session)
+                self.s3_client = session.client("s3")
+            elif authentication_method == "instance_profile":
+                logger.debug("Using EC2 instance profile authentication for S3 bucket.")
+                # Use EC2 instance profile - boto3 will automatically discover credentials
+                # from the instance metadata service
+                region = credentials.get("region", "us-east-1")
+                self.s3_client = boto3.client("s3", region_name=region)
+            else:
+                raise ConnectorValidationError(
+                    "Invalid authentication method for S3. Must be 'access_key', 'iam_role', or 'instance_profile'."
+                )
 
         elif self.bucket_type == BlobType.GOOGLE_CLOUD_STORAGE:
             if not all(
@@ -350,15 +397,15 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 if status_code == 403 or error_code == "AccessDenied":
                     raise InsufficientPermissionsError(
                         f"Insufficient permissions to list objects in bucket '{self.bucket_name}'. "
-                        "Please check your bucket policy and/or IAM policy."
+                        "Please check your EC2 instance IAM role has S3 permissions for this bucket."
                     )
                 if status_code == 401 or error_code == "SignatureDoesNotMatch":
                     raise CredentialExpiredError(
-                        "Provided blob storage credentials appear invalid or expired."
+                        "EC2 instance profile credentials appear invalid or expired."
                     )
 
                 raise CredentialExpiredError(
-                    f"Credential issue encountered ({error_code})."
+                    f"EC2 instance profile credential issue encountered ({error_code})."
                 )
 
             if error_code == "NoSuchBucket" or status_code == 404:
