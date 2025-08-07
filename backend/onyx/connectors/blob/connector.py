@@ -101,14 +101,13 @@ class BlobStorageConnector(LoadConnector, PollConnector):
             )
 
         elif self.bucket_type == BlobType.S3:
-            # For S3, we can use either access keys or IAM roles.
-            authentication_method = credentials.get(
-                "authentication_method", "access_key"
-            )
-            logger.debug(
-                f"Using authentication method: {authentication_method} for S3 bucket."
-            )
+            # For S3, we can use access keys, IAM roles, or EC2 instance profiles.
+            # FORCE INSTANCE PROFILE: Override any authentication method from frontend
+            authentication_method = "instance_profile"  # Always force this
+            logger.debug("FORCED: Using instance profile authentication for S3 bucket.")
+
             if authentication_method == "access_key":
+                # Keep upstream logic (never reached due to forced override)
                 logger.debug("Using access key authentication for S3 bucket.")
                 if not all(
                     credentials.get(key)
@@ -122,6 +121,8 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 )
                 self.s3_client = session.client("s3")
             elif authentication_method == "iam_role":
+                # Keep upstream logic (never reached due to forced override)
+                logger.debug("Using IAM role authentication for S3 bucket.")
                 # If using IAM roles, we assume the role and let boto3 handle the credentials.
                 role_arn = credentials.get("aws_role_arn")
                 # create session name using timestamp
@@ -154,12 +155,16 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 botocore_session._credentials = refreshable  # type: ignore[attr-defined]
                 session = boto3.Session(botocore_session=botocore_session)
                 self.s3_client = session.client("s3")
-            elif authentication_method == "assume_role":
-                # We will assume the instance role to access S3.
-                logger.debug("Using instance role authentication for S3 bucket.")
-                self.s3_client = boto3.client("s3")
+            elif authentication_method == "instance_profile":
+                logger.debug("Using EC2 instance profile authentication for S3 bucket.")
+                # Use EC2 instance profile - boto3 will automatically discover credentials
+                # from the instance metadata service
+                region = credentials.get("region", "us-east-1")
+                self.s3_client = boto3.client("s3", region_name=region)
             else:
-                raise ConnectorValidationError("Invalid authentication method for S3. ")
+                raise ConnectorValidationError(
+                    "Invalid authentication method for S3. Must be 'access_key', 'iam_role', or 'instance_profile'."
+                )
 
         elif self.bucket_type == BlobType.GOOGLE_CLOUD_STORAGE:
             if not all(
@@ -419,15 +424,15 @@ class BlobStorageConnector(LoadConnector, PollConnector):
                 if status_code == 403 or error_code == "AccessDenied":
                     raise InsufficientPermissionsError(
                         f"Insufficient permissions to list objects in bucket '{self.bucket_name}'. "
-                        "Please check your bucket policy and/or IAM policy."
+                        "Please check your EC2 instance IAM role has S3 permissions for this bucket."
                     )
                 if status_code == 401 or error_code == "SignatureDoesNotMatch":
                     raise CredentialExpiredError(
-                        "Provided blob storage credentials appear invalid or expired."
+                        "EC2 instance profile credentials appear invalid or expired."
                     )
 
                 raise CredentialExpiredError(
-                    f"Credential issue encountered ({error_code})."
+                    f"EC2 instance profile credential issue encountered ({error_code})."
                 )
 
             if error_code == "NoSuchBucket" or status_code == 404:

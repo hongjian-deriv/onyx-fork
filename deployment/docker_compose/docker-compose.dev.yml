@@ -319,6 +319,7 @@ services:
         - NEXT_PUBLIC_THEME=${NEXT_PUBLIC_THEME:-}
         # DO NOT TURN ON unless you have EXPLICIT PERMISSION from Onyx.
         - NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED=${NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED:-false}
+        - NODE_OPTIONS=--max-old-space-size=4096
     depends_on:
       - api_server
     restart: unless-stopped
@@ -441,7 +442,7 @@ services:
       - DOMAIN=localhost
     ports:
       - "80:80"
-      - "3000:80" # allow for localhost:3000 usage, since that is the norm
+      - "3001:80" # allow for localhost:3001 usage, since that is the norm for us
     volumes:
       - ../data/nginx:/etc/nginx/conf.d
     logging:
