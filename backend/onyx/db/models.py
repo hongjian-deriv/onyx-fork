@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import validates
 from typing_extensions import TypedDict  # noreorder
 from uuid import UUID
+from pydantic import ValidationError
 
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 
@@ -43,7 +44,11 @@ from sqlalchemy import PrimaryKeyConstraint
 
 from onyx.auth.schemas import UserRole
 from onyx.configs.chat_configs import NUM_POSTPROCESSED_RESULTS
-from onyx.configs.constants import DEFAULT_BOOST, MilestoneRecordType
+from onyx.configs.constants import (
+    DEFAULT_BOOST,
+    FederatedConnectorSource,
+    MilestoneRecordType,
+)
 from onyx.configs.constants import DocumentSource
 from onyx.configs.constants import FileOrigin
 from onyx.configs.constants import MessageType
@@ -64,6 +69,7 @@ from onyx.db.enums import IndexingStatus
 from onyx.db.enums import IndexModelStatus
 from onyx.db.enums import TaskStatus
 from onyx.db.pydantic_type import PydanticType
+from onyx.kg.models import KGEntityTypeAttributes
 from onyx.utils.logger import setup_logger
 from onyx.utils.special_types import JSON_ro
 from onyx.file_store.models import FileDescriptor
@@ -602,6 +608,10 @@ class Document(Base):
     retrieval_feedbacks: Mapped[list["DocumentRetrievalFeedback"]] = relationship(
         "DocumentRetrievalFeedback", back_populates="document"
     )
+
+    doc_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        postgresql.JSONB(), nullable=True, default=None
+    )
     tags = relationship(
         "Tag",
         secondary=Document__Tag.__table__,
@@ -614,22 +624,6 @@ class Document(Base):
             last_modified,
             last_synced,
         ),
-    )
-
-
-# TODO: restructure config management
-class KGConfig(Base):
-    __tablename__ = "kg_config"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
-    kg_variable_name: Mapped[str] = mapped_column(NullFilteredString, nullable=False)
-    kg_variable_values: Mapped[list[str]] = mapped_column(
-        postgresql.ARRAY(String), nullable=False, default=list
-    )
-
-    __table_args__ = (
-        UniqueConstraint("kg_variable_name", name="uq_kg_config_variable_name"),
     )
 
 
@@ -647,13 +641,23 @@ class KGEntityType(Base):
         NullFilteredString, nullable=False, index=False
     )
 
-    attributes: Mapped[dict] = mapped_column(
+    attributes: Mapped[dict | None] = mapped_column(
         postgresql.JSONB,
         nullable=True,
         default=dict,
         server_default="{}",
         comment="Filtering based on document attribute",
     )
+
+    @property
+    def parsed_attributes(self) -> KGEntityTypeAttributes:
+        if self.attributes is None:
+            return KGEntityTypeAttributes()
+
+        try:
+            return KGEntityTypeAttributes(**self.attributes)
+        except ValidationError:
+            return KGEntityTypeAttributes()
 
     occurrences: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
@@ -843,16 +847,10 @@ class KGEntity(Base):
 
     # Basic entity information
     name: Mapped[str] = mapped_column(NullFilteredString, nullable=False, index=True)
-    entity_class: Mapped[str] = mapped_column(
-        NullFilteredString, nullable=True, index=True
-    )
     entity_key: Mapped[str] = mapped_column(
         NullFilteredString, nullable=True, index=True
     )
     parent_key: Mapped[str | None] = mapped_column(
-        NullFilteredString, nullable=True, index=True
-    )
-    entity_subtype: Mapped[str] = mapped_column(
         NullFilteredString, nullable=True, index=True
     )
 
@@ -991,21 +989,10 @@ class KGEntityExtractionStaging(Base):
         nullable=True,
     )
 
-    # Basic entity information
-    entity_class: Mapped[str] = mapped_column(
-        NullFilteredString, nullable=True, index=True
-    )
-
-    # Basic entity information
+    # Parent Child Information
     entity_key: Mapped[str] = mapped_column(
         NullFilteredString, nullable=True, index=True
     )
-
-    entity_subtype: Mapped[str] = mapped_column(
-        NullFilteredString, nullable=True, index=True
-    )
-
-    # Basic entity information
     parent_key: Mapped[str | None] = mapped_column(
         NullFilteredString, nullable=True, index=True
     )
@@ -1376,14 +1363,14 @@ class Connector(Base):
         if self.refresh_freq is not None:
             if self.refresh_freq < 60:
                 raise ValueError(
-                    "refresh_freq must be greater than or equal to 60 seconds."
+                    "refresh_freq must be greater than or equal to 1 minute."
                 )
 
     def validate_prune_freq(self) -> None:
         if self.prune_freq is not None:
-            if self.prune_freq < 86400:
+            if self.prune_freq < 300:
                 raise ValueError(
-                    "prune_freq must be greater than or equal to 86400 seconds."
+                    "prune_freq must be greater than or equal to 5 minutes."
                 )
 
 
@@ -1426,6 +1413,80 @@ class Credential(Base):
     )
 
     user: Mapped[User | None] = relationship("User", back_populates="credentials")
+
+
+class FederatedConnector(Base):
+    __tablename__ = "federated_connector"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[FederatedConnectorSource] = mapped_column(
+        Enum(FederatedConnectorSource, native_enum=False)
+    )
+    credentials: Mapped[dict[str, str]] = mapped_column(EncryptedJson(), nullable=False)
+
+    oauth_tokens: Mapped[list["FederatedConnectorOAuthToken"]] = relationship(
+        "FederatedConnectorOAuthToken",
+        back_populates="federated_connector",
+        cascade="all, delete-orphan",
+    )
+    document_sets: Mapped[list["FederatedConnector__DocumentSet"]] = relationship(
+        "FederatedConnector__DocumentSet",
+        back_populates="federated_connector",
+        cascade="all, delete-orphan",
+    )
+
+
+class FederatedConnectorOAuthToken(Base):
+    """NOTE: in the future, can be made more general to support OAuth tokens
+    for actions."""
+
+    __tablename__ = "federated_connector_oauth_token"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    federated_connector_id: Mapped[int] = mapped_column(
+        ForeignKey("federated_connector.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    token: Mapped[str] = mapped_column(EncryptedString(), nullable=False)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
+    federated_connector: Mapped["FederatedConnector"] = relationship(
+        "FederatedConnector", back_populates="oauth_tokens"
+    )
+    user: Mapped["User"] = relationship("User")
+
+
+class FederatedConnector__DocumentSet(Base):
+    __tablename__ = "federated_connector__document_set"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    federated_connector_id: Mapped[int] = mapped_column(
+        ForeignKey("federated_connector.id", ondelete="CASCADE"), nullable=False
+    )
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE"), nullable=False
+    )
+    # unique per source type. Validated before insertion.
+    entities: Mapped[dict[str, Any]] = mapped_column(postgresql.JSONB(), nullable=False)
+
+    federated_connector: Mapped["FederatedConnector"] = relationship(
+        "FederatedConnector", back_populates="document_sets"
+    )
+    document_set: Mapped["DocumentSet"] = relationship(
+        "DocumentSet", back_populates="federated_connectors"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "federated_connector_id",
+            "document_set_id",
+            name="uq_federated_connector_document_set",
+        ),
+    )
 
 
 class SearchSettings(Base):
@@ -1555,9 +1616,7 @@ class SearchSettings(Base):
 
     @property
     def final_embedding_dim(self) -> int:
-        if self.reduced_dimension:
-            return self.reduced_dimension
-        return self.model_dim
+        return self.reduced_dimension or self.model_dim
 
     @staticmethod
     def can_use_large_chunks(
@@ -1578,7 +1637,7 @@ class SearchSettings(Base):
 
 class IndexAttempt(Base):
     """
-    Represents an attempt to index a group of 1 or more documents from a
+    Represents an attempt to index a group of 0 or more documents from a
     source. For example, a single pull from Google Drive, a single event from
     slack event API, or a single website crawl.
     """
@@ -1625,6 +1684,30 @@ class IndexAttempt(Base):
     # Points to the last checkpoint that was saved for this run. The pointer here
     # can be taken to the FileStore to grab the actual checkpoint value
     checkpoint_pointer: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # NEW: Database-based coordination fields (replacing Redis fencing)
+    celery_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    cancellation_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # NEW: Batch coordination fields (replacing FileStore state)
+    total_batches: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completed_batches: Mapped[int] = mapped_column(Integer, default=0)
+    # TODO: unused, remove this column
+    total_failures_batch_level: Mapped[int] = mapped_column(Integer, default=0)
+    total_chunks: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Progress tracking for stall detection
+    last_progress_time: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_batches_completed_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # NEW: Heartbeat tracking for worker liveness detection
+    heartbeat_counter: Mapped[int] = mapped_column(Integer, default=0)
+    last_heartbeat_value: Mapped[int] = mapped_column(Integer, default=0)
+    last_heartbeat_time: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     time_created: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1676,6 +1759,13 @@ class IndexAttempt(Base):
             "status",
             desc("time_updated"),
         ),
+        # NEW: Index for coordination queries
+        Index(
+            "ix_index_attempt_active_coordination",
+            "connector_credential_pair_id",
+            "search_settings_id",
+            "status",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -1689,6 +1779,13 @@ class IndexAttempt(Base):
 
     def is_finished(self) -> bool:
         return self.status.is_terminal()
+
+    def is_coordination_complete(self) -> bool:
+        """Check if all batches have been processed"""
+        return (
+            self.total_batches is not None
+            and self.completed_batches >= self.total_batches
+        )
 
 
 class IndexAttemptError(Base):
@@ -2333,6 +2430,13 @@ class DocumentSet(Base):
         secondary="document_set__user_group",
         viewonly=True,
     )
+    federated_connectors: Mapped[list["FederatedConnector__DocumentSet"]] = (
+        relationship(
+            "FederatedConnector__DocumentSet",
+            back_populates="document_set",
+            cascade="all, delete-orphan",
+        )
+    )
 
 
 class Prompt(Base):
@@ -2710,15 +2814,28 @@ class KVStore(Base):
     encrypted_value: Mapped[JSON_ro] = mapped_column(EncryptedJson(), nullable=True)
 
 
-class PGFileStore(Base):
-    __tablename__ = "file_store"
+class FileRecord(Base):
+    __tablename__ = "file_record"
 
-    file_name: Mapped[str] = mapped_column(String, primary_key=True)
+    # Internal file ID, must be unique across all files.
+    file_id: Mapped[str] = mapped_column(String, primary_key=True)
+
     display_name: Mapped[str] = mapped_column(String, nullable=True)
     file_origin: Mapped[FileOrigin] = mapped_column(Enum(FileOrigin, native_enum=False))
     file_type: Mapped[str] = mapped_column(String, default="text/plain")
     file_metadata: Mapped[JSON_ro] = mapped_column(postgresql.JSONB(), nullable=True)
-    lobj_oid: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # External storage support (S3, MinIO, Azure Blob, etc.)
+    bucket_name: Mapped[str] = mapped_column(String)
+    object_key: Mapped[str] = mapped_column(String)
+
+    # Timestamps for external storage
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class AgentSearchMetrics(Base):
@@ -3024,6 +3141,22 @@ class User__ExternalUserGroupId(Base):
         ForeignKey("connector_credential_pair.id"), primary_key=True
     )
 
+    # Signifies whether or not the group should be cleaned up at the end of a
+    # group sync run.
+    stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index(
+            "ix_user_external_group_cc_pair_stale",
+            "cc_pair_id",
+            "stale",
+        ),
+        Index(
+            "ix_user_external_group_stale",
+            "stale",
+        ),
+    )
+
 
 class PublicExternalUserGroup(Base):
     """Stores all public external user "groups".
@@ -3039,17 +3172,33 @@ class PublicExternalUserGroup(Base):
         ForeignKey("connector_credential_pair.id", ondelete="CASCADE"), primary_key=True
     )
 
+    # Signifies whether or not the group should be cleaned up at the end of a
+    # group sync run.
+    stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index(
+            "ix_public_external_group_cc_pair_stale",
+            "cc_pair_id",
+            "stale",
+        ),
+        Index(
+            "ix_public_external_group_stale",
+            "stale",
+        ),
+    )
+
 
 class UsageReport(Base):
     """This stores metadata about usage reports generated by admin including user who generated
-    them as well las the period they cover. The actual zip file of the report is stored as a lo
-    using the PGFileStore
+    them as well as the period they cover. The actual zip file of the report is stored as a lo
+    using the FileRecord
     """
 
     __tablename__ = "usage_reports"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    report_name: Mapped[str] = mapped_column(ForeignKey("file_store.file_name"))
+    report_name: Mapped[str] = mapped_column(ForeignKey("file_record.file_id"))
 
     # if None, report was auto-generated
     requestor_user_id: Mapped[UUID | None] = mapped_column(
@@ -3064,7 +3213,7 @@ class UsageReport(Base):
     period_to: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
     requestor = relationship("User")
-    file = relationship("PGFileStore")
+    file = relationship("FileRecord")
 
 
 class InputPrompt(Base):

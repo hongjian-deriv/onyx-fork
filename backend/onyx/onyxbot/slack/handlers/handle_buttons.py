@@ -18,7 +18,7 @@ from onyx.connectors.slack.utils import expert_info_from_slack_id
 from onyx.context.search.models import SavedSearchDoc
 from onyx.db.chat import get_chat_message
 from onyx.db.chat import translate_db_message_to_chat_message_detail
-from onyx.db.engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.feedback import create_chat_message_feedback
 from onyx.db.feedback import create_doc_retrieval_feedback
 from onyx.db.users import get_user_by_email
@@ -177,7 +177,7 @@ def handle_generate_answer_button(
                 sender_id=user_id or None,
                 email=email or None,
                 bypass_filters=True,
-                is_bot_msg=False,
+                is_slash_command=False,
                 is_bot_dm=False,
             ),
             slack_channel_config=slack_channel_config,

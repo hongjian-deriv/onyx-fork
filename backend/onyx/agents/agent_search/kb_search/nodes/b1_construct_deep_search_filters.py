@@ -13,7 +13,7 @@ from onyx.agents.agent_search.shared_graph_utils.utils import (
     get_langgraph_node_log_string,
 )
 from onyx.configs.kg_configs import KG_FILTER_CONSTRUCTION_TIMEOUT
-from onyx.db.engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.entity_type import get_entity_types_with_grounded_source_name
 from onyx.kg.utils.formatting_utils import make_entity_id
 from onyx.prompts.kg_prompts import SEARCH_FILTER_CONSTRUCTION_PROMPT
@@ -52,10 +52,6 @@ def construct_deep_search_filters(
         )
     else:
         source_document_results_str = "(no source document results generated)"
-
-    logger.info(
-        f"B1 - characters in source_document_results_str: len{source_document_results_str}"
-    )
 
     search_filter_construction_prompt = (
         SEARCH_FILTER_CONSTRUCTION_PROMPT.replace(
@@ -136,7 +132,6 @@ def construct_deep_search_filters(
                 structure=[],
             )
 
-            logger.info(f"B1 - filter_results: {filter_results}")
     except Exception as e:
         logger.error(f"Error in construct_deep_search_filters: {e}")
         filter_results = KGFilterConstructionResults(

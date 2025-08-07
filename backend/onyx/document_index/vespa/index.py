@@ -75,6 +75,7 @@ from onyx.document_index.vespa_constants import VESPA_TIMEOUT
 from onyx.document_index.vespa_constants import YQL_BASE
 from onyx.indexing.models import DocMetadataAwareIndexChunk
 from onyx.key_value_store.factory import get_shared_kv_store
+from onyx.kg.utils.formatting_utils import split_relationship_id
 from onyx.utils.batching import batch_generator
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import MULTI_TENANT
@@ -86,17 +87,6 @@ logger = setup_logger()
 # Set the logging level to WARNING to ignore INFO and DEBUG logs
 httpx_logger = logging.getLogger("httpx")
 httpx_logger.setLevel(logging.WARNING)
-
-
-def update_kg_type_dict(
-    dict_to_update: dict[str, dict], kg_type: str, value_set: set[str]
-) -> dict[str, dict]:
-    if "fields" not in dict_to_update:
-        dict_to_update["fields"] = {}
-    dict_to_update["fields"][kg_type] = {
-        "assign": {kg_type_object: 1 for kg_type_object in value_set}
-    }
-    return dict_to_update
 
 
 @dataclass
@@ -124,8 +114,6 @@ class KGUChunkUpdateRequest(BaseModel):
     entities: set[str] | None = None
     relationships: set[str] | None = None
     terms: set[str] | None = None
-    converted_attributes: set[str] | None = None
-    attributes: dict[str, str | list[str]] | None = None
 
 
 class KGUDocumentUpdateRequest(BaseModel):
@@ -137,6 +125,29 @@ class KGUDocumentUpdateRequest(BaseModel):
     entities: set[str]
     relationships: set[str]
     terms: set[str]
+
+
+def generate_kg_update_request(
+    kg_update_request: KGUChunkUpdateRequest,
+) -> dict[str, dict]:
+    kg_update_dict: dict[str, dict] = {}
+
+    if kg_update_request.entities is not None:
+        kg_update_dict["kg_entities"] = {"assign": list(kg_update_request.entities)}
+
+    if kg_update_request.relationships is not None:
+        kg_update_dict["kg_relationships"] = {"assign": []}
+        for relationship in kg_update_request.relationships:
+            source, rel_type, target = split_relationship_id(relationship)
+            kg_update_dict["kg_relationships"]["assign"].append(
+                {
+                    "source": source,
+                    "rel_type": rel_type,
+                    "target": target,
+                }
+            )
+
+    return kg_update_dict
 
 
 def in_memory_zip_from_file_bytes(file_contents: dict[str, bytes]) -> BinaryIO:
@@ -556,12 +567,10 @@ class VespaIndex(DocumentIndex):
     ) -> None:
         """Runs a batch of updates in parallel via the ThreadPoolExecutor."""
 
+        @retry(tries=3, delay=1, backoff=2, jitter=(0.0, 1.0))
         def _kg_update_chunk(
             update: KGVespaChunkUpdateRequest, http_client: httpx.Client
         ) -> httpx.Response:
-            # logger.debug(
-            #     f"Updating KG with request to {update.url} with body {update.update_request}"
-            # )
             return http_client.put(
                 update.url,
                 headers={"Content-Type": "application/json"},
@@ -571,16 +580,13 @@ class VespaIndex(DocumentIndex):
         # NOTE: using `httpx` here since `requests` doesn't support HTTP2. This is beneficient for
         # indexing / updates / deletes since we have to make a large volume of requests.
 
-        with (
-            concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as executor,
-            httpx_client as http_client,
-        ):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
             for update_batch in batch_generator(updates, batch_size):
                 future_to_document_id = {
                     executor.submit(
                         _kg_update_chunk,
                         update,
-                        http_client,
+                        httpx_client,
                     ): update.document_id
                     for update in update_batch
                 }
@@ -589,7 +595,10 @@ class VespaIndex(DocumentIndex):
                     try:
                         res.raise_for_status()
                     except requests.HTTPError as e:
-                        failure_msg = f"Failed to update document: {future_to_document_id[future]}"
+                        failure_msg = (
+                            f"Failed to update document {future_to_document_id[future]}\n"
+                            f"Response: {res.text}"
+                        )
                         raise requests.HTTPError(failure_msg) from e
 
     def update(self, update_requests: list[UpdateRequest], *, tenant_id: str) -> None:
@@ -685,23 +694,9 @@ class VespaIndex(DocumentIndex):
         # Build the _VespaUpdateRequest objects
 
         for kg_update_request in kg_update_requests:
-            kg_update_dict: dict[str, dict] = {"fields": {}}
-
-            if kg_update_request.relationships is not None:
-                kg_update_dict = update_kg_type_dict(
-                    kg_update_dict, "kg_relationships", kg_update_request.relationships
-                )
-
-            if kg_update_request.entities is not None:
-                kg_update_dict = update_kg_type_dict(
-                    kg_update_dict, "kg_entities", kg_update_request.entities
-                )
-
-            if kg_update_request.terms is not None:
-                kg_update_dict = update_kg_type_dict(
-                    kg_update_dict, "kg_terms", kg_update_request.terms
-                )
-
+            kg_update_dict: dict[str, dict] = {
+                "fields": generate_kg_update_request(kg_update_request)
+            }
             if not kg_update_dict["fields"]:
                 logger.error("Update request received but nothing to update")
                 continue

@@ -65,7 +65,8 @@ POSTGRES_CELERY_BEAT_APP_NAME = "celery_beat"
 POSTGRES_CELERY_WORKER_PRIMARY_APP_NAME = "celery_worker_primary"
 POSTGRES_CELERY_WORKER_LIGHT_APP_NAME = "celery_worker_light"
 POSTGRES_CELERY_WORKER_HEAVY_APP_NAME = "celery_worker_heavy"
-POSTGRES_CELERY_WORKER_INDEXING_APP_NAME = "celery_worker_indexing"
+POSTGRES_CELERY_WORKER_DOCPROCESSING_APP_NAME = "celery_worker_docprocessing"
+POSTGRES_CELERY_WORKER_DOCFETCHING_APP_NAME = "celery_worker_docfetching"
 POSTGRES_CELERY_WORKER_MONITORING_APP_NAME = "celery_worker_monitoring"
 POSTGRES_CELERY_WORKER_INDEXING_CHILD_APP_NAME = "celery_worker_indexing_child"
 POSTGRES_CELERY_WORKER_KG_PROCESSING_APP_NAME = "celery_worker_kg_processing"
@@ -97,6 +98,7 @@ KV_INSTANCE_DOMAIN_KEY = "instance_domain"
 KV_ENTERPRISE_SETTINGS_KEY = "onyx_enterprise_settings"
 KV_CUSTOM_ANALYTICS_SCRIPT_KEY = "__custom_analytics_script__"
 KV_DOCUMENTS_SEEDED_KEY = "documents_seeded"
+KV_KG_CONFIG_KEY = "kg_config"
 
 # NOTE: we use this timeout / 4 in various places to refresh a lock
 # might be worth separating this timeout into separate timeouts for each situation
@@ -120,6 +122,8 @@ CELERY_INDEXING_WATCHDOG_CONNECTOR_TIMEOUT = 3 * 60 * 60  # 3 hours (in seconds)
 # hard termination should always fire first if the connector is hung
 CELERY_INDEXING_LOCK_TIMEOUT = CELERY_INDEXING_WATCHDOG_CONNECTOR_TIMEOUT + 900
 
+# Heartbeat interval for indexing worker liveness detection
+INDEXING_WORKER_HEARTBEAT_INTERVAL = 30  # seconds
 
 # how long a task should wait for associated fence to be ready
 CELERY_TASK_WAIT_FOR_FENCE_TIMEOUT = 5 * 60  # 5 min
@@ -149,8 +153,8 @@ class DocumentSource(str, Enum):
     GURU = "guru"
     BOOKSTACK = "bookstack"
     CONFLUENCE = "confluence"
-    SLAB = "slab"
     JIRA = "jira"
+    SLAB = "slab"
     PRODUCTBOARD = "productboard"
     FILE = "file"
     NOTION = "notion"
@@ -185,8 +189,19 @@ class DocumentSource(str, Enum):
     AIRTABLE = "airtable"
     HIGHSPOT = "highspot"
 
+    IMAP = "imap"
+
     # Special case just for integration tests
     MOCK_CONNECTOR = "mock_connector"
+
+
+class FederatedConnectorSource(str, Enum):
+    FEDERATED_SLACK = "federated_slack"
+
+    def to_non_federated_source(self) -> DocumentSource | None:
+        if self == FederatedConnectorSource.FEDERATED_SLACK:
+            return DocumentSource.SLACK
+        return None
 
 
 DocumentSourceRequiringTenantContext: list[DocumentSource] = [DocumentSource.FILE]
@@ -319,8 +334,11 @@ class OnyxCeleryQueues:
     CSV_GENERATION = "csv_generation"
 
     # Indexing queue
-    CONNECTOR_INDEXING = "connector_indexing"
     USER_FILES_INDEXING = "user_files_indexing"
+
+    # Document processing pipeline queue
+    DOCPROCESSING = "docprocessing"
+    CONNECTOR_DOC_FETCHING = "connector_doc_fetching"
 
     # Monitoring queue
     MONITORING = "monitoring"
@@ -452,7 +470,11 @@ class OnyxCeleryTask:
     CONNECTOR_EXTERNAL_GROUP_SYNC_GENERATOR_TASK = (
         "connector_external_group_sync_generator_task"
     )
-    CONNECTOR_INDEXING_PROXY_TASK = "connector_indexing_proxy_task"
+
+    # New split indexing tasks
+    CONNECTOR_DOC_FETCHING_TASK = "connector_doc_fetching_task"
+    DOCPROCESSING_TASK = "docprocessing_task"
+
     CONNECTOR_PRUNING_GENERATOR_TASK = "connector_pruning_generator_task"
     DOCUMENT_BY_CC_PAIR_CLEANUP_TASK = "document_by_cc_pair_cleanup_task"
     VESPA_METADATA_SYNC_TASK = "vespa_metadata_sync_task"
@@ -471,6 +493,7 @@ class OnyxCeleryTask:
     KG_PROCESSING = "kg_processing"
     KG_CLUSTERING_ONLY = "kg_clustering_only"
     CHECK_KG_PROCESSING_CLUSTERING_ONLY = "check_kg_processing_clustering_only"
+    KG_RESET_SOURCE_INDEX = "kg_reset_source_index"
 
 
 # this needs to correspond to the matching entry in supervisord
@@ -487,5 +510,5 @@ else:
 
 
 class OnyxCallTypes(str, Enum):
-    FIREFLIES = "fireflies"
-    GONG = "gong"
+    FIREFLIES = "FIREFLIES"
+    GONG = "GONG"

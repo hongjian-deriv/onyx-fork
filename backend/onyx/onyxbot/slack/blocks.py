@@ -23,7 +23,7 @@ from onyx.configs.constants import SearchFeedbackType
 from onyx.configs.onyxbot_configs import DANSWER_BOT_NUM_DOCS_TO_DISPLAY
 from onyx.context.search.models import SavedSearchDoc
 from onyx.db.chat import get_chat_session_by_message_id
-from onyx.db.engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import ChannelConfig
 from onyx.onyxbot.slack.constants import CONTINUE_IN_WEB_UI_ACTION_ID
 from onyx.onyxbot.slack.constants import DISLIKE_BLOCK_ACTION_ID
@@ -151,7 +151,7 @@ def _build_ephemeral_publication_block(
             email=message_info.email,
             sender_id=message_info.sender_id,
             thread_messages=[],
-            is_bot_msg=message_info.is_bot_msg,
+            is_slash_command=message_info.is_slash_command,
             is_bot_dm=message_info.is_bot_dm,
             thread_to_respond=respond_ts,
         )
@@ -225,10 +225,10 @@ def _build_doc_feedback_block(
 
 def get_restate_blocks(
     msg: str,
-    is_bot_msg: bool,
+    is_slash_command: bool,
 ) -> list[Block]:
     # Only the slash command needs this context because the user doesn't see their own input
-    if not is_bot_msg:
+    if not is_slash_command:
         return []
 
     return [
@@ -576,7 +576,7 @@ def build_slack_response_blocks(
     # If called with the OnyxBot slash command, the question is lost so we have to reshow it
     if not skip_restated_question:
         restate_question_block = get_restate_blocks(
-            message_info.thread_messages[-1].message, message_info.is_bot_msg
+            message_info.thread_messages[-1].message, message_info.is_slash_command
         )
     else:
         restate_question_block = []

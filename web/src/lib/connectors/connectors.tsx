@@ -51,6 +51,12 @@ export interface SelectOption extends Option {
   default?: string;
 }
 
+export interface MultiSelectOption extends Option {
+  type: "multiselect";
+  options?: StringWithDescription[];
+  default?: string[];
+}
+
 export interface ListOption extends Option {
   type: "list";
   default?: string[];
@@ -96,6 +102,7 @@ export interface TabOption extends Option {
       | TextOption
       | NumberOption
       | SelectOption
+      | MultiSelectOption
       | FileOption
       | StringTabOption
     )[];
@@ -113,6 +120,7 @@ export interface ConnectionConfiguration {
     | TextOption
     | NumberOption
     | SelectOption
+    | MultiSelectOption
     | FileOption
     | TabOption
   )[];
@@ -122,6 +130,7 @@ export interface ConnectionConfiguration {
     | TextOption
     | NumberOption
     | SelectOption
+    | MultiSelectOption
     | FileOption
     | TabOption
   )[];
@@ -590,14 +599,59 @@ export const connectorConfigs: Record<
     description: "Configure Salesforce connector",
     values: [
       {
-        type: "list",
-        query: "Enter requested objects:",
-        label: "Requested Objects",
-        name: "requested_objects",
+        type: "tab",
+        name: "salesforce_config_type",
+        label: "Configuration Type",
         optional: true,
-        description: `Specify the Salesforce object types you want us to index. If unsure, don't specify any objects and Onyx will default to indexing by 'Account'.
+        tabs: [
+          {
+            value: "simple",
+            label: "Simple",
+            fields: [
+              {
+                type: "list",
+                query: "Enter requested objects:",
+                label: "Requested Objects",
+                name: "requested_objects",
+                optional: true,
+                description: `Specify the Salesforce object types you want us to index. If unsure, don't specify any objects and Onyx will default to indexing by 'Account'.
 
 Hint: Use the singular form of the object name (e.g., 'Opportunity' instead of 'Opportunities').`,
+              },
+            ],
+          },
+          {
+            value: "advanced",
+            label: "Advanced",
+            fields: [
+              {
+                type: "text",
+                query: "Enter custom query config:",
+                label: "Custom Query Config",
+                name: "custom_query_config",
+                optional: true,
+                isTextArea: true,
+                description: `Enter a JSON configuration that precisely defines which fields and child objects to index. This gives you complete control over the data structure.
+
+Example:
+{
+  "Account": {
+    "fields": ["Id", "Name", "Industry"],
+    "associations": {
+      "Contact": {
+        "fields": ["Id", "FirstName", "LastName", "Email"],
+        "associations": {}
+      }
+    }
+  }
+}
+
+See our docs for more details.`,
+              },
+            ],
+          },
+        ],
+        defaultTab: "simple",
       },
     ],
     advanced_values: [],
@@ -757,7 +811,7 @@ For example, specifying .*-support.* as a "channel" will cause the connector to 
       {
         type: "file",
         query: "Enter file locations:",
-        label: "File Locations",
+        label: "Files",
         name: "file_locations",
         optional: false,
       },
@@ -801,7 +855,24 @@ For example, specifying .*-support.* as a "channel" will cause the connector to 
   },
   hubspot: {
     description: "Configure HubSpot connector",
-    values: [],
+    values: [
+      {
+        type: "multiselect",
+        query: "Select which HubSpot objects to index:",
+        label: "Object Types",
+        name: "object_types",
+        options: [
+          { name: "Tickets", value: "tickets" },
+          { name: "Companies", value: "companies" },
+          { name: "Deals", value: "deals" },
+          { name: "Contacts", value: "contacts" },
+        ],
+        default: ["tickets", "companies", "deals", "contacts"],
+        description:
+          "Choose which HubSpot object types to index. All types are selected by default.",
+        optional: false,
+      },
+    ],
     advanced_values: [],
   },
   document360: {
@@ -1307,10 +1378,42 @@ For example, specifying .*-support.* as a "channel" will cause the connector to 
     ],
     advanced_values: [],
   },
+  imap: {
+    description: "Configure Email connector",
+    values: [
+      {
+        type: "text",
+        query: "Enter the IMAP server host:",
+        label: "IMAP Server Host",
+        name: "host",
+        optional: false,
+        description:
+          "The IMAP server hostname (e.g., imap.gmail.com, outlook.office365.com)",
+      },
+      {
+        type: "number",
+        query: "Enter the IMAP server port:",
+        label: "IMAP Server Port",
+        name: "port",
+        optional: true,
+        default: 993,
+        description: "The IMAP server port (default: 993 for SSL)",
+      },
+      {
+        type: "list",
+        query: "Enter mailboxes to include:",
+        label: "Mailboxes",
+        name: "mailboxes",
+        optional: true,
+        description:
+          "Specify mailboxes to index (e.g., INBOX, Sent, Drafts). Leave empty to index all mailboxes.",
+      },
+    ],
+    advanced_values: [],
+  },
 };
 export function createConnectorInitialValues(
-  connector: ConfigurableSources,
-  currentCredential: Credential<any> | null = null
+  connector: ConfigurableSources
 ): Record<string, any> & AccessTypeGroupSelectorFormType {
   const configuration = connectorConfigs[connector];
 
@@ -1324,17 +1427,10 @@ export function createConnectorInitialValues(
           acc[field.name] = null;
         } else if (field.type === "list") {
           acc[field.name] = field.default || [];
+        } else if (field.type === "multiselect") {
+          acc[field.name] = field.default || [];
         } else if (field.type === "checkbox") {
-          // Special case for include_files_shared_with_me when using service account
-          if (
-            field.name === "include_files_shared_with_me" &&
-            currentCredential &&
-            !currentCredential.credential_json?.google_tokens
-          ) {
-            acc[field.name] = true;
-          } else {
-            acc[field.name] = field.default || false;
-          }
+          acc[field.name] = field.default || false;
         } else if (field.default !== undefined) {
           acc[field.name] = field.default;
         }
@@ -1360,11 +1456,13 @@ export function createConnectorValidationSchema(
             ? Yup.string()
             : field.type === "list"
               ? Yup.array().of(Yup.string())
-              : field.type === "checkbox"
-                ? Yup.boolean()
-                : field.type === "file"
-                  ? Yup.mixed()
-                  : Yup.string();
+              : field.type === "multiselect"
+                ? Yup.array().of(Yup.string())
+                : field.type === "checkbox"
+                  ? Yup.boolean()
+                  : field.type === "file"
+                    ? Yup.mixed()
+                    : Yup.string();
 
         if (!field.optional) {
           schema = schema.required(`${field.label} is required`);
@@ -1377,14 +1475,20 @@ export function createConnectorValidationSchema(
     ),
     // These are advanced settings
     indexingStart: Yup.string().nullable(),
-    pruneFreq: Yup.number().min(0, "Prune frequency must be non-negative"),
-    refreshFreq: Yup.number().min(0, "Refresh frequency must be non-negative"),
+    pruneFreq: Yup.number().min(
+      0.083,
+      "Prune frequency must be at least 0.083 hours (5 minutes)"
+    ),
+    refreshFreq: Yup.number().min(
+      1,
+      "Refresh frequency must be at least 1 minute"
+    ),
   });
 
   return object;
 }
 
-export const defaultPruneFreqDays = 30; // 30 days
+export const defaultPruneFreqHours = 720; // 30 days in hours
 export const defaultRefreshFreqMinutes = 30; // 30 minutes
 
 // CONNECTORS
@@ -1518,6 +1622,7 @@ export interface LoopioConfig {
 
 export interface FileConfig {
   file_locations: string[];
+  file_names: string[];
   zip_metadata: Record<string, any>;
 }
 
@@ -1530,7 +1635,9 @@ export interface NotionConfig {
   root_page_id?: string;
 }
 
-export interface HubSpotConfig {}
+export interface HubSpotConfig {
+  object_types?: string[];
+}
 
 export interface Document360Config {
   workspace: string;
@@ -1603,3 +1710,9 @@ export interface MediaWikiConfig extends MediaWikiBaseConfig {
 }
 
 export interface WikipediaConfig extends MediaWikiBaseConfig {}
+
+export interface ImapConfig {
+  host: string;
+  port?: number;
+  mailboxes?: string[];
+}

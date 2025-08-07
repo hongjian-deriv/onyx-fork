@@ -14,6 +14,7 @@ from onyx.agents.agent_search.orchestration.nodes.call_tool import ToolCallExcep
 from onyx.chat.answer import Answer
 from onyx.chat.chat_utils import create_chat_chain
 from onyx.chat.chat_utils import create_temporary_persona
+from onyx.chat.chat_utils import process_kg_commands
 from onyx.chat.models import AgenticMessageResponseIDInfo
 from onyx.chat.models import AgentMessageIDInfo
 from onyx.chat.models import AgentSearchPacket
@@ -78,8 +79,7 @@ from onyx.db.chat import reserve_message_id
 from onyx.db.chat import translate_db_message_to_chat_message_detail
 from onyx.db.chat import translate_db_search_doc_to_server_search_doc
 from onyx.db.chat import update_chat_session_updated_at_timestamp
-from onyx.db.engine import get_session_context_manager
-from onyx.db.kg_config import get_kg_config_settings
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.milestone import check_multi_assistant_milestone
 from onyx.db.milestone import create_milestone_if_not_exists
 from onyx.db.milestone import update_user_assistant_milestone
@@ -97,15 +97,7 @@ from onyx.file_store.models import FileDescriptor
 from onyx.file_store.models import InMemoryChatFile
 from onyx.file_store.utils import load_all_chat_files
 from onyx.file_store.utils import save_files
-from onyx.kg.clustering.clustering import kg_clustering
-from onyx.kg.configuration import populate_default_account_employee_definitions
-from onyx.kg.configuration import populate_default_grounded_entity_types
-from onyx.kg.extractions.extraction_processing import kg_extraction
-from onyx.kg.resets.reset_extractions import reset_extraction_kg_index
-from onyx.kg.resets.reset_index import reset_full_kg_index
-from onyx.kg.resets.reset_normalizations import reset_normalization_kg_index
-from onyx.kg.resets.reset_source import reset_source_kg_index
-from onyx.kg.resets.reset_vespa import reset_vespa_kg_index
+from onyx.kg.models import KGException
 from onyx.llm.exceptions import GenAIDisabledException
 from onyx.llm.factory import get_llms_for_persona
 from onyx.llm.factory import get_main_llm_from_tuple
@@ -136,16 +128,16 @@ from onyx.tools.tool_implementations.images.image_generation_tool import (
     ImageGenerationResponse,
 )
 from onyx.tools.tool_implementations.internet_search.internet_search_tool import (
-    INTERNET_SEARCH_RESPONSE_ID,
-)
-from onyx.tools.tool_implementations.internet_search.internet_search_tool import (
-    internet_search_response_to_search_docs,
-)
-from onyx.tools.tool_implementations.internet_search.internet_search_tool import (
-    InternetSearchResponse,
+    INTERNET_SEARCH_RESPONSE_SUMMARY_ID,
 )
 from onyx.tools.tool_implementations.internet_search.internet_search_tool import (
     InternetSearchTool,
+)
+from onyx.tools.tool_implementations.internet_search.models import (
+    InternetSearchResponseSummary,
+)
+from onyx.tools.tool_implementations.internet_search.utils import (
+    internet_search_response_to_search_docs,
 )
 from onyx.tools.tool_implementations.search.search_tool import (
     FINAL_CONTEXT_DOCUMENTS_ID,
@@ -289,7 +281,7 @@ def _handle_internet_search_tool_response_summary(
     packet: ToolResponse,
     db_session: Session,
 ) -> tuple[QADocsResponse, list[DbSearchDoc]]:
-    internet_search_response = cast(InternetSearchResponse, packet.response)
+    internet_search_response = cast(InternetSearchResponseSummary, packet.response)
     server_search_docs = internet_search_response_to_search_docs(
         internet_search_response
     )
@@ -304,10 +296,10 @@ def _handle_internet_search_tool_response_summary(
     ]
     return (
         QADocsResponse(
-            rephrased_query=internet_search_response.revised_query,
+            rephrased_query=internet_search_response.query,
             top_documents=response_docs,
             predicted_flow=QueryFlow.QUESTION_ANSWER,
-            predicted_search=SearchType.SEMANTIC,
+            predicted_search=SearchType.INTERNET,
             applied_source_filters=[],
             applied_time_cutoff=None,
             recency_bias_multiplier=1.0,
@@ -499,7 +491,7 @@ def _process_tool_response(
             ]
         )
         yield FileChatDisplay(file_ids=[str(file_id) for file_id in file_ids])
-    elif packet.id == INTERNET_SEARCH_RESPONSE_ID:
+    elif packet.id == INTERNET_SEARCH_RESPONSE_SUMMARY_ID:
         (
             info.qa_docs_response,
             info.reference_db_search_docs,
@@ -570,58 +562,6 @@ def stream_chat_message_objects(
 
     llm: LLM
 
-    kg_config_settings = get_kg_config_settings(db_session)
-
-    if kg_config_settings.KG_ENABLED:
-
-        # Temporarily, until we have a draft UI for the KG Operations/Management
-
-        # get Vespa index
-        search_settings = get_current_search_settings(db_session)
-        index_str = search_settings.index_name
-
-        # TODO: Move these special calls  to endpoints
-        if new_msg_req.message == "kg_e":
-            kg_extraction(tenant_id, index_str)
-            raise Exception("Extractions done")
-
-        elif new_msg_req.message == "kg_c":
-            kg_clustering(tenant_id, index_str)
-            raise Exception("Clustering done")
-
-        elif new_msg_req.message == "kg":
-            reset_vespa_kg_index(tenant_id, index_str)
-            reset_full_kg_index()
-            kg_extraction(tenant_id, index_str)
-            kg_clustering(tenant_id, index_str)
-            raise Exception("Full KG index reset done")
-
-        elif new_msg_req.message == "kg_rs_full":
-            reset_full_kg_index()
-            raise Exception("Full KG index reset done")
-
-        elif new_msg_req.message == "kg_rs_extraction":
-            reset_extraction_kg_index()
-            raise Exception("Extraction KG index reset done")
-
-        elif new_msg_req.message == "kg_rs_normalization":
-            reset_normalization_kg_index()
-            raise Exception("Normalization KG index reset done")
-
-        elif new_msg_req.message.startswith("kg_rs_source:"):
-            source_name = new_msg_req.message.split(":")[1].strip()
-            reset_source_kg_index(source_name, tenant_id, index_str)
-            raise Exception(f"KG index reset for source {source_name} done")
-
-        elif new_msg_req.message == "kg_rs_vespa":
-            reset_vespa_kg_index(tenant_id, index_str)
-            raise Exception("Vespa KG index reset done")
-
-        elif new_msg_req.message == "kg_setup":
-            populate_default_grounded_entity_types()
-            populate_default_account_employee_definitions()
-            raise Exception("KG setup done")
-
     try:
         # Move these variables inside the try block
         user_id = user.id if user is not None else None
@@ -650,6 +590,9 @@ def stream_chat_message_objects(
             db_session=db_session,
             default_persona=chat_session.persona,
         )
+
+        # TODO: remove once we have an endpoint for this stuff
+        process_kg_commands(new_msg_req.message, persona.name, tenant_id, db_session)
 
         multi_assistant_milestone, _is_new = create_milestone_if_not_exists(
             user=user,
@@ -782,9 +725,7 @@ def stream_chat_message_objects(
                     )
 
         # load all files needed for this chat chain in memory
-        files = load_all_chat_files(
-            history_msgs, new_msg_req.file_descriptors, db_session
-        )
+        files = load_all_chat_files(history_msgs, new_msg_req.file_descriptors)
         req_file_ids = [f["id"] for f in new_msg_req.file_descriptors]
         latest_query_files = [file for file in files if file.file_id in req_file_ids]
         user_file_ids = new_msg_req.user_file_ids or []
@@ -963,7 +904,6 @@ def stream_chat_message_objects(
             citation_config=CitationConfig(
                 all_docs_useful=selected_db_search_docs is not None
             ),
-            document_pruning_config=document_pruning_config,
             structured_response_format=new_msg_req.structured_response_format,
         )
 
@@ -993,6 +933,7 @@ def stream_chat_message_objects(
             ),
             internet_search_tool_config=InternetSearchToolConfig(
                 answer_style_config=answer_style_config,
+                document_pruning_config=document_pruning_config,
             ),
             image_generation_tool_config=ImageGenerationToolConfig(
                 additional_headers=litellm_additional_headers,
@@ -1069,6 +1010,7 @@ def stream_chat_message_objects(
             tools=tools,
             db_session=db_session,
             use_agentic_search=new_msg_req.use_agentic_search,
+            skip_gen_ai_answer_generation=new_msg_req.skip_gen_ai_answer_generation,
         )
 
         info_by_subq: dict[SubQuestionKey, AnswerPostInfo] = defaultdict(
@@ -1114,6 +1056,10 @@ def stream_chat_message_objects(
         yield StreamingError(error=error_msg)
         db_session.rollback()
         return
+
+    # TODO: remove after moving kg stuff to api endpoint
+    except KGException:
+        raise
 
     except Exception as e:
         logger.exception(f"Failed to process chat message due to {e}")
@@ -1293,7 +1239,7 @@ def stream_chat_message(
     is_connected: Callable[[], bool] | None = None,
 ) -> Iterator[str]:
     start_time = time.time()
-    with get_session_context_manager() as db_session:
+    with get_session_with_current_tenant() as db_session:
         objects = stream_chat_message_objects(
             new_msg_req=new_msg_req,
             user=user,

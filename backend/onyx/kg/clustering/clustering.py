@@ -1,18 +1,23 @@
+import time
 from collections.abc import Generator
 from typing import cast
 
 from rapidfuzz.fuzz import ratio
+from redis.lock import Lock as RedisLock
 from sqlalchemy import func
 from sqlalchemy import text
 
+from onyx.background.celery.tasks.kg_processing.utils import extend_lock
+from onyx.configs.constants import CELERY_GENERIC_BEAT_LOCK_TIMEOUT
 from onyx.configs.kg_configs import KG_CLUSTERING_RETRIEVE_THRESHOLD
 from onyx.configs.kg_configs import KG_CLUSTERING_THRESHOLD
-from onyx.db.engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.entities import KGEntity
 from onyx.db.entities import KGEntityExtractionStaging
 from onyx.db.entities import merge_entities
 from onyx.db.entities import transfer_entity
 from onyx.db.kg_config import get_kg_config_settings
+from onyx.db.kg_config import validate_kg_settings
 from onyx.db.models import Document
 from onyx.db.models import KGEntityType
 from onyx.db.models import KGRelationshipExtractionStaging
@@ -25,12 +30,11 @@ from onyx.document_index.vespa.kg_interactions import (
     get_kg_vespa_info_update_requests_for_document,
 )
 from onyx.document_index.vespa.kg_interactions import update_kg_chunks_vespa_info
-from onyx.kg.configuration import validate_kg_settings
 from onyx.kg.models import KGGroundingType
 from onyx.kg.utils.formatting_utils import make_relationship_id
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
-from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA
 
 logger = setup_logger()
 
@@ -113,6 +117,33 @@ def _get_batch_entities_with_parent(
             offset += batch_size
 
 
+def _get_batch_kg_processed_documents(
+    batch_size: int,
+) -> Generator[list[Document], None, None]:
+    offset = 0
+
+    while True:
+        with get_session_with_current_tenant() as db_session:
+            batch = (
+                db_session.query(Document)
+                .join(
+                    KGEntityExtractionStaging,
+                    Document.id == KGEntityExtractionStaging.document_id,
+                )
+                .filter(
+                    KGEntityExtractionStaging.transferred_id_name.is_not(None),
+                )
+                .order_by(Document.id)
+                .offset(offset)
+                .limit(batch_size)
+                .all()
+            )
+            if not batch:
+                break
+            yield batch
+            offset += batch_size
+
+
 def _cluster_one_grounded_entity(
     entity: KGEntityExtractionStaging,
 ) -> tuple[KGEntity, bool]:
@@ -149,7 +180,7 @@ def _cluster_one_grounded_entity(
                     # find entities of the same type with a similar name
                     *filtering,
                     KGEntity.entity_type_id_name == entity.entity_type_id_name,
-                    getattr(func, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE).similarity_op(
+                    getattr(func, POSTGRES_DEFAULT_SCHEMA).similarity_op(
                         KGEntity.name, entity_name
                     ),
                 )
@@ -232,21 +263,15 @@ def _create_one_parent_child_relationship(entity: KGEntityExtractionStaging) -> 
         db_session.commit()
 
 
-def _transfer_batch_relationship_and_update_vespa(
-    relationships: list[KGRelationshipExtractionStaging],
-    index_name: str,
-    tenant_id: str,
+def _transfer_one_relationship(
+    relationship: KGRelationshipExtractionStaging,
 ) -> None:
-    docs_to_update: set[str] = set()
-
     with get_session_with_current_tenant() as db_session:
-        entity_id_names: set[str] = set()
-
         # get the translations
-        staging_entity_id_names: set[str] = set()
-        for relationship in relationships:
-            staging_entity_id_names.add(relationship.source_node)
-            staging_entity_id_names.add(relationship.target_node)
+        staging_entity_id_names = {
+            relationship.source_node,
+            relationship.target_node,
+        }
         entity_translations: dict[str, str] = {
             entity.id_name: entity.transferred_id_name
             for entity in db_session.query(KGEntityExtractionStaging)
@@ -254,43 +279,26 @@ def _transfer_batch_relationship_and_update_vespa(
             .all()
             if entity.transferred_id_name is not None
         }
-
-        # transfer the relationships
-        for relationship in relationships:
-            transferred_relationship = transfer_relationship(
-                db_session=db_session,
-                relationship=relationship,
-                entity_translations=entity_translations,
+        if len(entity_translations) != len(staging_entity_id_names):
+            logger.error(
+                f"Missing entity translations for {staging_entity_id_names - entity_translations.keys()}"
             )
-            entity_id_names.add(transferred_relationship.source_node)
-            entity_id_names.add(transferred_relationship.target_node)
+            return
+
+        # transfer the relationship
+        transfer_relationship(
+            db_session=db_session,
+            relationship=relationship,
+            entity_translations=entity_translations,
+        )
         db_session.commit()
-
-        # get all documents that require a vespa update
-        docs_to_update |= {
-            entity.document_id
-            for entity in db_session.query(KGEntity)
-            .filter(KGEntity.id_name.in_(entity_id_names))
-            .all()
-            if entity.document_id is not None
-        }
-
-    # update vespa in parallel
-    batch_update_requests = run_functions_tuples_in_parallel(
-        [
-            (
-                get_kg_vespa_info_update_requests_for_document,
-                (document_id, index_name, tenant_id),
-            )
-            for document_id in docs_to_update
-        ]
-    )
-    for update_requests in batch_update_requests:
-        update_kg_chunks_vespa_info(update_requests, index_name, tenant_id)
 
 
 def kg_clustering(
-    tenant_id: str, index_name: str, processing_chunk_batch_size: int = 16
+    tenant_id: str,
+    index_name: str,
+    lock: RedisLock,
+    processing_chunk_batch_size: int = 16,
 ) -> None:
     """
     Here we will cluster the extractions based on their cluster frameworks.
@@ -306,18 +314,30 @@ def kg_clustering(
     """
     logger.info(f"Starting kg clustering for tenant {tenant_id}")
 
-    with get_session_with_current_tenant() as db_session:
-        kg_config_settings = get_kg_config_settings(db_session)
+    kg_config_settings = get_kg_config_settings()
     validate_kg_settings(kg_config_settings)
 
+    last_lock_time = time.monotonic()
+
     # Cluster and transfer grounded entities sequentially
-    for untransferred_grounded_entities in _get_batch_untransferred_grounded_entities(
-        batch_size=processing_chunk_batch_size
+    start_time = time.monotonic()
+    i_batch = 0
+    for i_batch, untransferred_grounded_entities in enumerate(
+        _get_batch_untransferred_grounded_entities(
+            batch_size=processing_chunk_batch_size
+        )
     ):
         for entity in untransferred_grounded_entities:
             _cluster_one_grounded_entity(entity)
+        last_lock_time = extend_lock(
+            lock, CELERY_GENERIC_BEAT_LOCK_TIMEOUT, last_lock_time
+        )
+        # logger.debug(f"Transferred entities batch {i}")
     # NOTE: we assume every entity is transferred, as we currently only have grounded entities
-    logger.info("Finished transferring all entities")
+    time_delta = time.monotonic() - start_time
+    logger.info(
+        f"Finished transferring {i_batch+1} entity batches in {time_delta:.2f}s"
+    )
 
     # Create parent-child relationships in parallel
     for _ in range(kg_config_settings.KG_MAX_PARENT_RECURSION_DEPTH):
@@ -330,29 +350,76 @@ def kg_clustering(
                     for root_entity in root_entities
                 ]
             )
+            last_lock_time = extend_lock(
+                lock, CELERY_GENERIC_BEAT_LOCK_TIMEOUT, last_lock_time
+            )
     logger.info("Finished creating all parent-child relationships")
 
     # Transfer the relationship types (no need to do in parallel as there's only a few)
-    for relationship_types in _get_batch_untransferred_relationship_types(
-        batch_size=processing_chunk_batch_size
+    start_time = time.monotonic()
+    i_batch = 0
+    for i_batch, relationship_types in enumerate(
+        _get_batch_untransferred_relationship_types(
+            batch_size=processing_chunk_batch_size
+        )
     ):
         with get_session_with_current_tenant() as db_session:
             for relationship_type in relationship_types:
                 transfer_relationship_type(db_session, relationship_type)
             db_session.commit()
-    logger.info("Finished transferring all relationship types")
-
-    # Transfer the relationships and update vespa in parallel
-    # NOTE we assume there are no entities that aren't part of any relationships
-    for untransferred_relationships in _get_batch_untransferred_relationships(
-        batch_size=processing_chunk_batch_size
-    ):
-        _transfer_batch_relationship_and_update_vespa(
-            relationships=untransferred_relationships,
-            index_name=index_name,
-            tenant_id=tenant_id,
+        last_lock_time = extend_lock(
+            lock, CELERY_GENERIC_BEAT_LOCK_TIMEOUT, last_lock_time
         )
-    logger.info("Finished transferring all relationships")
+        # logger.debug(f"Transferred relationship types batch {i}")
+    time_delta = time.monotonic() - start_time
+    logger.info(
+        f"Finished transferring {i_batch+1} relationship type batches in {time_delta:.2f}s"
+    )
+
+    # Transfer the relationships in parallel
+    start_time = time.monotonic()
+    i_batch = 0
+    for i_batch, relationships in enumerate(
+        _get_batch_untransferred_relationships(batch_size=processing_chunk_batch_size)
+    ):
+        run_functions_tuples_in_parallel(
+            [
+                (_transfer_one_relationship, (relationship,))
+                for relationship in relationships
+            ]
+        )
+        last_lock_time = extend_lock(
+            lock, CELERY_GENERIC_BEAT_LOCK_TIMEOUT, last_lock_time
+        )
+        # logger.debug(f"Transferred relationships batch {i}")
+    time_delta = time.monotonic() - start_time
+    logger.info(
+        f"Finished transferring {i_batch+1} relationship batches in {time_delta:.2f}s"
+    )
+
+    # Update vespa for each document
+    start_time = time.monotonic()
+    i_batch = 0
+    for i_batch, documents in enumerate(
+        _get_batch_kg_processed_documents(batch_size=processing_chunk_batch_size)
+    ):
+        batch_update_requests = run_functions_tuples_in_parallel(
+            [
+                (get_kg_vespa_info_update_requests_for_document, (document.id,))
+                for document in documents
+            ]
+        )
+        for update_requests, document in zip(batch_update_requests, documents):
+            try:
+                update_kg_chunks_vespa_info(update_requests, index_name, tenant_id)
+            except Exception as e:
+                logger.error(f"Error updating vespa for document {document.id}: {e}")
+        last_lock_time = extend_lock(
+            lock, CELERY_GENERIC_BEAT_LOCK_TIMEOUT, last_lock_time
+        )
+        # logger.debug(f"Updated vespa for documents batch {i}")
+    time_delta = time.monotonic() - start_time
+    logger.info(f"Finished updating {i_batch+1} document batches in {time_delta:.2f}s")
 
     # Delete the transferred objects from the staging tables
     try:
@@ -381,3 +448,4 @@ def kg_clustering(
             db_session.commit()
     except Exception as e:
         logger.error(f"Error deleting entities: {e}")
+    logger.info("Finished deleting all transferred staging entries")

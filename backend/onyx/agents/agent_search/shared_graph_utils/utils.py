@@ -56,7 +56,7 @@ from onyx.context.search.enums import LLMEvaluationType
 from onyx.context.search.models import InferenceSection
 from onyx.context.search.models import RetrievalDetails
 from onyx.context.search.models import SearchRequest
-from onyx.db.engine import get_session_context_manager
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.persona import get_persona_by_id
 from onyx.db.persona import Persona
 from onyx.llm.chat_llm import LLMRateLimitError
@@ -174,7 +174,6 @@ def get_test_config(
             # The docs retrieved by this flow are already relevance-filtered
             all_docs_useful=True
         ),
-        document_pruning_config=document_pruning_config,
         structured_response_format=None,
     )
 
@@ -198,7 +197,7 @@ def get_test_config(
         prompt_config=prompt_config,
         llm=primary_llm,
         fast_llm=fast_llm,
-        pruning_config=search_tool_config.document_pruning_config,
+        document_pruning_config=search_tool_config.document_pruning_config,
         answer_style_config=search_tool_config.answer_style_config,
         selected_sections=search_tool_config.selected_sections,
         chunks_above=search_tool_config.chunks_above,
@@ -363,7 +362,7 @@ def retrieve_search_docs(
     retrieved_docs: list[InferenceSection] = []
 
     # new db session to avoid concurrency issues
-    with get_session_context_manager() as db_session:
+    with get_session_with_current_tenant() as db_session:
         for tool_response in search_tool.run(
             query=question,
             override_kwargs=SearchToolOverrideKwargs(

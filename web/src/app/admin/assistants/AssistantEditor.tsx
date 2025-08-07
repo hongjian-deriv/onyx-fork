@@ -5,7 +5,7 @@ import { Option } from "@/components/Dropdown";
 import { generateRandomIconShape } from "@/lib/assistantIconUtils";
 import {
   CCPairBasicInfo,
-  DocumentSet,
+  DocumentSetSummary,
   User,
   UserGroup,
   UserRole,
@@ -14,11 +14,7 @@ import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { ArrayHelpers, FieldArray, Form, Formik, FormikProps } from "formik";
 
-import {
-  BooleanFormField,
-  Label,
-  TextFormField,
-} from "@/components/admin/connectors/Field";
+import { BooleanFormField, Label, TextFormField } from "@/components/Field";
 
 import { usePopup } from "@/components/admin/connectors/Popup";
 import { getDisplayNameForModel, useLabels } from "@/lib/hooks";
@@ -40,8 +36,9 @@ import {
 } from "@/components/ui/tooltip";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import * as Yup from "yup";
+import { SettingsContext } from "@/components/settings/SettingsProvider";
 import { FullPersona, PersonaLabel, StarterMessage } from "./interfaces";
 import {
   PersonaUpsertParameters,
@@ -126,17 +123,15 @@ export function AssistantEditor({
   llmProviders,
   tools,
   shouldAddAssistantToUserPreferences,
-  admin,
 }: {
   existingPersona?: FullPersona | null;
   ccPairs: CCPairBasicInfo[];
-  documentSets: DocumentSet[];
+  documentSets: DocumentSetSummary[];
   user: User | null;
   defaultPublic: boolean;
   llmProviders: LLMProviderView[];
   tools: ToolSnapshot[];
   shouldAddAssistantToUserPreferences?: boolean;
-  admin?: boolean;
 }) {
   const { refreshAssistants, isImageGenerationAvailable } = useAssistants();
 
@@ -147,6 +142,7 @@ export function AssistantEditor({
   const { popup, setPopup } = usePopup();
   const { labels, refreshLabels, createLabel, updateLabel, deleteLabel } =
     useLabels();
+  const settings = useContext(SettingsContext);
 
   const colorOptions = [
     "#FF6FBF",
@@ -237,6 +233,14 @@ export function AssistantEditor({
 
   const [showVisibilityWarning, setShowVisibilityWarning] = useState(false);
 
+  const canShowKnowledgeSource =
+    ccPairs.length > 0 &&
+    searchTool &&
+    !(user?.role === UserRole.BASIC && documentSets.length === 0);
+
+  const userKnowledgeEnabled =
+    settings?.settings?.user_knowledge_enabled ?? true;
+
   const initialValues = {
     name: existingPersona?.name ?? "",
     description: existingPersona?.description ?? "",
@@ -259,7 +263,7 @@ export function AssistantEditor({
       existingPersona?.llm_model_version_override ?? null,
     starter_messages: existingPersona?.starter_messages?.length
       ? existingPersona.starter_messages
-      : [{ message: "" }],
+      : [{ message: "", name: "" }],
     enabled_tools_map: enabledToolsMap,
     icon_color: existingPersona?.icon_color ?? defautIconColor,
     icon_shape: existingPersona?.icon_shape ?? defaultIconShape,
@@ -275,11 +279,14 @@ export function AssistantEditor({
     selectedGroups: existingPersona?.groups ?? [],
     user_file_ids: existingPersona?.user_file_ids ?? [],
     user_folder_ids: existingPersona?.user_folder_ids ?? [],
-    knowledge_source:
-      (existingPersona?.user_file_ids?.length ?? 0) > 0 ||
-      (existingPersona?.user_folder_ids?.length ?? 0) > 0
-        ? "user_files"
-        : "team_knowledge",
+    knowledge_source: !canShowKnowledgeSource
+      ? "user_files"
+      : !userKnowledgeEnabled
+        ? "team_knowledge"
+        : (existingPersona?.user_file_ids?.length ?? 0) > 0 ||
+            (existingPersona?.user_folder_ids?.length ?? 0) > 0
+          ? "user_files"
+          : "team_knowledge",
     is_default_persona: existingPersona?.is_default_persona ?? false,
   };
 
@@ -374,11 +381,6 @@ export function AssistantEditor({
     }
   };
 
-  const canShowKnowledgeSource =
-    ccPairs.length > 0 &&
-    searchTool &&
-    !(user?.role != "admin" && documentSets.length === 0);
-
   return (
     <div className="mx-auto max-w-4xl">
       <style>
@@ -389,12 +391,9 @@ export function AssistantEditor({
           }
         `}
       </style>
-      {!admin && (
-        <div className="absolute top-4 left-4">
-          <BackButton />
-        </div>
-      )}
-
+      <div className="absolute top-4 left-4">
+        <BackButton />
+      </div>
       {presentingDocument && (
         <TextView
           presentingDocument={presentingDocument}
@@ -526,6 +525,14 @@ export function AssistantEditor({
             .map((toolId) => Number(toolId))
             .filter((toolId) => values.enabled_tools_map[toolId]);
 
+          if (
+            internetSearchTool &&
+            enabledTools.includes(internetSearchTool.id)
+          ) {
+            // Internet searches should generally be datetime-aware
+            formikHelpers.setFieldValue("datetime_aware", true);
+          }
+
           const searchToolEnabled = searchTool
             ? enabledTools.includes(searchTool.id)
             : false;
@@ -534,10 +541,8 @@ export function AssistantEditor({
           // to tell the backend to not fetch any documents
           const numChunks = searchToolEnabled ? values.num_chunks || 25 : 0;
           const starterMessages = values.starter_messages
-            .filter(
-              (message: { message: string }) => message.message.trim() !== ""
-            )
-            .map((message: { message: string; name?: string }) => ({
+            .filter((message: StarterMessage) => message.message.trim() !== "")
+            .map((message: StarterMessage) => ({
               message: message.message,
               name: message.message,
             }));
@@ -950,38 +955,39 @@ export function AssistantEditor({
                                   </p>
                                 </div>
 
-                                <div
-                                  className={`w-[150px] h-[110px] rounded-lg border flex flex-col items-center justify-center cursor-pointer transition-all ${
-                                    values.knowledge_source === "user_files"
-                                      ? "border-2 border-blue-500 bg-blue-50 dark:bg-blue-950/20"
-                                      : "border-gray-200 hover:border-gray-300 dark:border-gray-700 dark:hover:border-gray-600"
-                                  }`}
-                                  onClick={() =>
-                                    setFieldValue(
-                                      "knowledge_source",
-                                      "user_files"
-                                    )
-                                  }
-                                >
-                                  <div className="text-blue-500 mb-2">
-                                    <FileIcon size={24} />
+                                {userKnowledgeEnabled && (
+                                  <div
+                                    className={`w-[150px] h-[110px] rounded-lg border flex flex-col items-center justify-center cursor-pointer transition-all ${
+                                      values.knowledge_source === "user_files"
+                                        ? "border-2 border-blue-500 bg-blue-50 dark:bg-blue-950/20"
+                                        : "border-gray-200 hover:border-gray-300 dark:border-gray-700 dark:hover:border-gray-600"
+                                    }`}
+                                    onClick={() =>
+                                      setFieldValue(
+                                        "knowledge_source",
+                                        "user_files"
+                                      )
+                                    }
+                                  >
+                                    <div className="text-blue-500 mb-2">
+                                      <FileIcon size={24} />
+                                    </div>
+                                    <p className="font-medium text-xs">
+                                      User Knowledge
+                                    </p>
                                   </div>
-                                  <p className="font-medium text-xs">
-                                    User Knowledge
-                                  </p>
-                                </div>
+                                )}
                               </div>
                             </div>
                           </>
                         )}
 
                         {values.knowledge_source === "user_files" &&
-                          !existingPersona?.is_default_persona &&
-                          !admin && (
+                          !existingPersona?.is_default_persona && (
                             <div className="text-sm flex flex-col items-start">
                               <SubLabel>
-                                Click below to add documents or folders from the
-                                My Document feature
+                                Click below to add documents or folders from My
+                                Documents
                               </SubLabel>
                               {(values.user_file_ids.length > 0 ||
                                 values.user_folder_ids.length > 0) && (
@@ -1016,30 +1022,34 @@ export function AssistantEditor({
 
                         {values.knowledge_source === "team_knowledge" &&
                           ccPairs.length > 0 && (
-                            <div className="mt-4">
-                              <div>
-                                <SubLabel>
-                                  <>
-                                    Select which{" "}
-                                    {!user || user.role === "admin" ? (
-                                      <Link
-                                        href="/admin/documents/sets"
-                                        className="font-semibold underline hover:underline text-text"
-                                        target="_blank"
-                                      >
-                                        Document Sets
-                                      </Link>
-                                    ) : (
-                                      "Team Document Sets"
-                                    )}{" "}
-                                    this Assistant should use to inform its
-                                    responses. If none are specified, the
-                                    Assistant will reference all available
-                                    documents.
-                                  </>
-                                </SubLabel>
-                              </div>
-
+                            <>
+                              {canShowKnowledgeSource && (
+                                <div className="mt-4">
+                                  <div>
+                                    <SubLabel>
+                                      <>
+                                        Select which{" "}
+                                        {!user ||
+                                        user.role !== UserRole.BASIC ? (
+                                          <Link
+                                            href="/admin/documents/sets"
+                                            className="font-semibold underline hover:underline text-text"
+                                            target="_blank"
+                                          >
+                                            Document Sets
+                                          </Link>
+                                        ) : (
+                                          "Team Document Sets"
+                                        )}{" "}
+                                        this Assistant should use to inform its
+                                        responses. If none are specified, the
+                                        Assistant will reference all available
+                                        documents.
+                                      </>
+                                    </SubLabel>
+                                  </div>
+                                </div>
+                              )}
                               {documentSets.length > 0 ? (
                                 <FieldArray
                                   name="document_set_ids"
@@ -1082,7 +1092,7 @@ export function AssistantEditor({
                                   </Link>
                                 </p>
                               )}
-                            </div>
+                            </>
                           )}
                       </div>
                     )}
@@ -1185,7 +1195,7 @@ export function AssistantEditor({
                 {showAdvancedOptions && (
                   <>
                     <div className="max-w-4xl w-full">
-                      {user?.role == UserRole.ADMIN && (
+                      {user?.role === UserRole.ADMIN && (
                         <BooleanFormField
                           onChange={(checked) => {
                             if (checked) {
@@ -1479,7 +1489,7 @@ export function AssistantEditor({
                                   {option.name}
                                 </span>
                               </div>
-                              {admin && (
+                              {user?.role === UserRole.ADMIN && (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -1596,32 +1606,33 @@ export function AssistantEditor({
                   </>
                 )}
 
-                <div className="mt-12 gap-x-2 w-full justify-end flex">
-                  <Button
-                    type="submit"
-                    disabled={isSubmitting || isRequestSuccessful}
-                  >
-                    {isUpdate ? "Update" : "Create"}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => router.back()}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-
-                <div className="flex justify-end">
-                  {existingPersona && (
+                <div className="mt-12 w-full flex justify-between items-center">
+                  <div>
+                    {existingPersona && (
+                      <Button
+                        variant="destructive"
+                        onClick={openDeleteModal}
+                        type="button"
+                      >
+                        Delete
+                      </Button>
+                    )}
+                  </div>
+                  <div className="flex gap-x-2">
                     <Button
-                      variant="destructive"
-                      onClick={openDeleteModal}
-                      type="button"
+                      type="submit"
+                      disabled={isSubmitting || isRequestSuccessful}
                     >
-                      Delete
+                      {isUpdate ? "Update" : "Create"}
                     </Button>
-                  )}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => router.back()}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
               </Form>
             </>

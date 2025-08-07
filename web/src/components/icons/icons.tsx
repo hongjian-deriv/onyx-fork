@@ -30,6 +30,7 @@ import {
   FiCpu,
   FiInfo,
   FiBarChart2,
+  FiMail,
 } from "react-icons/fi";
 import { SiBookstack } from "react-icons/si";
 import { StaticImageData } from "next/image";
@@ -41,6 +42,7 @@ import amazonSVG from "../../../public/Amazon.svg";
 import geminiSVG from "../../../public/Gemini.svg";
 import metaSVG from "../../../public/Meta.svg";
 import mistralSVG from "../../../public/Mistral.svg";
+import qwenSVG from "../../../public/Qwen.svg";
 import openSourceIcon from "../../../public/OpenSource.png";
 import litellmIcon from "../../../public/litellm.png";
 import azureIcon from "../../../public/Azure.png";
@@ -1005,6 +1007,11 @@ export const LightSettingsIcon = ({
   );
 };
 
+export const EmailIcon = ({
+  size = 24,
+  className = defaultTailwindCSSBlue,
+}: IconProps) => <FiMail size={size} className={className} />;
+
 //  COMPANY LOGOS
 
 export const LoopioIcon = ({
@@ -1149,6 +1156,11 @@ export const DeepseekIcon = ({
 }: IconProps) => (
   <LogoIcon size={size} className={className} src={deepseekSVG} />
 );
+
+export const QwenIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => <LogoIcon size={size} className={className} src={qwenSVG} />;
 
 export const MicrosoftIconSVG = ({
   size = 16,

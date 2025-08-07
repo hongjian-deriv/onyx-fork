@@ -19,7 +19,7 @@ from ee.onyx.server.enterprise_settings.store import (
 )
 from ee.onyx.server.enterprise_settings.store import upload_logo
 from onyx.context.search.enums import RecencyBiasSetting
-from onyx.db.engine import get_session_context_manager
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.llm import update_default_provider
 from onyx.db.llm import upsert_llm_provider
 from onyx.db.models import Tool
@@ -200,10 +200,10 @@ def _seed_enterprise_settings(seed_config: SeedConfiguration) -> None:
         store_ee_settings(final_enterprise_settings)
 
 
-def _seed_logo(db_session: Session, logo_path: str | None) -> None:
+def _seed_logo(logo_path: str | None) -> None:
     if logo_path:
         logger.notice("Uploading logo")
-        upload_logo(db_session=db_session, file=logo_path)
+        upload_logo(file=logo_path)
 
 
 def _seed_analytics_script(seed_config: SeedConfiguration) -> None:
@@ -235,7 +235,7 @@ def seed_db() -> None:
         logger.debug("No seeding configuration file passed")
         return
 
-    with get_session_context_manager() as db_session:
+    with get_session_with_current_tenant() as db_session:
         if seed_config.llms is not None:
             _seed_llms(db_session, seed_config.llms)
         if seed_config.personas is not None:
@@ -245,7 +245,7 @@ def seed_db() -> None:
         if seed_config.custom_tools is not None:
             _seed_custom_tools(db_session, seed_config.custom_tools)
 
-        _seed_logo(db_session, seed_config.seeded_logo_path)
+        _seed_logo(seed_config.seeded_logo_path)
         _seed_enterprise_settings(seed_config)
         _seed_analytics_script(seed_config)
 

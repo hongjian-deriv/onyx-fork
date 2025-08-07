@@ -14,6 +14,7 @@ export interface AuthMethodOption<TFields> {
   value: string;
   label: string;
   fields: TFields;
+  description?: string;
 }
 export interface CredentialTemplateWithAuth<TFields> {
   authentication_method?: string;
@@ -243,6 +244,11 @@ export interface HighspotCredentialJson {
   highspot_secret: string;
 }
 
+export interface ImapCredentialJson {
+  imap_username: string;
+  imap_password: string;
+}
+
 export const credentialTemplates: Record<ValidSources, any> = {
   github: { github_access_token: "" } as GithubCredentialJson,
   gitlab: {
@@ -338,6 +344,13 @@ export const credentialTemplates: Record<ValidSources, any> = {
           aws_role_arn: "",
         },
       },
+      {
+        value: "assume_role",
+        label: "Assume Role",
+        fields: {},
+        description:
+          "If you select this mode, the Amazon EC2 instance will assume its existing role to access S3. No additional credentials are required.",
+      },
     ],
   } as CredentialTemplateWithAuth<S3CredentialJson>,
   r2: {
@@ -378,6 +391,7 @@ export const credentialTemplates: Record<ValidSources, any> = {
   web: null,
   not_applicable: null,
   ingestion_api: null,
+  federated_slack: null,
   discord: { discord_bot_token: "" } as DiscordCredentialJson,
 
   // NOTE: These are Special Cases
@@ -391,6 +405,10 @@ export const credentialTemplates: Record<ValidSources, any> = {
     highspot_key: "",
     highspot_secret: "",
   } as HighspotCredentialJson,
+  imap: {
+    imap_username: "",
+    imap_password: "",
+  } as ImapCredentialJson,
 };
 
 export const credentialDisplayNames: Record<string, string> = {
@@ -475,6 +493,10 @@ export const credentialDisplayNames: Record<string, string> = {
   account_id: "R2 Account ID",
   r2_access_key_id: "R2 Access Key ID",
   r2_secret_access_key: "R2 Secret Access Key",
+
+  // IMAP
+  imap_username: "IMAP Username",
+  imap_password: "IMAP Password",
 
   // S3
   aws_access_key_id: "AWS Access Key ID",

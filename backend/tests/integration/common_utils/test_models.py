@@ -76,7 +76,7 @@ class DATestConnector(BaseModel):
 class SimpleTestDocument(BaseModel):
     id: str
     content: str
-    image_file_name: str | None = None
+    image_file_id: str | None = None
 
 
 class DATestCCPair(BaseModel):
@@ -117,6 +117,7 @@ class DATestDocumentSet(BaseModel):
     is_up_to_date: bool
     users: list[str] = Field(default_factory=list)
     groups: list[int] = Field(default_factory=list)
+    federated_connectors: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DATestPersona(BaseModel):

@@ -3,12 +3,16 @@ from datetime import datetime
 from datetime import timezone
 from typing import List
 
+from sqlalchemy import func
+from sqlalchemy import literal
 from sqlalchemy import select
 from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 import onyx.db.document as dbdocument
+from onyx.db.entity_type import UNGROUNDED_SOURCE_NAME
 from onyx.db.models import Document
 from onyx.db.models import KGEntity
 from onyx.db.models import KGEntityExtractionStaging
@@ -46,22 +50,13 @@ def upsert_staging_entity(
     id_name = make_entity_id(entity_type, name)
     attributes = attributes or {}
 
-    entity_type_split = entity_type.split("-")
-    entity_class, entity_subtype = (
-        entity_type_split if len(entity_type_split) == 2 else (entity_type, None)
-    )
-
     entity_key = attributes.get("key")
     entity_parent = attributes.get("parent")
 
     keep_attributes = {
         attr_key: attr_val
         for attr_key, attr_val in attributes.items()
-        if not (
-            (attr_key in ("key", "parent") and entity_class)
-            or attr_key in ("object_type", "issuetype")
-            or "_email" in attr_key
-        )
+        if attr_key not in ("key", "parent")
     }
 
     # Create new entity
@@ -71,8 +66,6 @@ def upsert_staging_entity(
             id_name=id_name,
             name=name,
             entity_type_id_name=entity_type,
-            entity_class=entity_class,
-            entity_subtype=entity_subtype,
             entity_key=entity_key,
             parent_key=entity_parent,
             document_id=document_id,
@@ -127,8 +120,6 @@ def transfer_entity(
         .values(
             id_name=make_entity_id(entity.entity_type_id_name, uuid.uuid4().hex[:20]),
             name=entity.name.casefold(),
-            entity_class=entity.entity_class,
-            entity_subtype=entity.entity_subtype,
             entity_key=entity.entity_key,
             parent_key=entity.parent_key,
             alternative_names=entity.alternative_names or [],
@@ -142,6 +133,13 @@ def transfer_entity(
             index_elements=["name", "entity_type_id_name", "document_id"],
             set_=dict(
                 occurrences=KGEntity.occurrences + entity.occurrences,
+                attributes=KGEntity.attributes.op("||")(
+                    literal(entity.attributes, JSONB)
+                ),
+                entity_key=func.coalesce(KGEntity.entity_key, entity.entity_key),
+                parent_key=func.coalesce(KGEntity.parent_key, entity.parent_key),
+                event_time=entity.event_time,
+                time_updated=datetime.now(),
             ),
         )
         .returning(KGEntity)
@@ -206,6 +204,9 @@ def merge_entities(
             document_id=document_id,
             alternative_names=list(alternative_names),
             occurrences=parent.occurrences + child.occurrences,
+            attributes=parent.attributes | child.attributes,
+            entity_key=parent.entity_key or child.entity_key,
+            parent_key=parent.parent_key or child.parent_key,
         )
         .returning(KGEntity)
     )
@@ -308,3 +309,33 @@ def get_entity_name(db_session: Session, entity_id_name: str) -> str | None:
         db_session.query(KGEntity).filter(KGEntity.id_name == entity_id_name).first()
     )
     return entity.name if entity else None
+
+
+def get_entity_stats_by_grounded_source_name(
+    db_session: Session,
+) -> dict[str, tuple[datetime, int]]:
+    """
+    Returns a dict mapping each grounded_source_name to a tuple in which:
+        - the first element is the latest update time across all entities with the same entity-type
+        - the second element is the count of `KGEntity`s
+    """
+    results = (
+        db_session.query(
+            KGEntityType.grounded_source_name,
+            func.count(KGEntity.id_name).label("entities_count"),
+            func.max(KGEntity.time_updated).label("last_updated"),
+        )
+        .join(KGEntityType, KGEntity.entity_type_id_name == KGEntityType.id_name)
+        .group_by(KGEntityType.grounded_source_name)
+        .all()
+    )
+
+    # `row.grounded_source_name` is NULLABLE in the database schema.
+    # Thus, for all "ungrounded" entity-types, we use a default name.
+    return {
+        (row.grounded_source_name or UNGROUNDED_SOURCE_NAME): (
+            row.last_updated,
+            row.entities_count,
+        )
+        for row in results
+    }

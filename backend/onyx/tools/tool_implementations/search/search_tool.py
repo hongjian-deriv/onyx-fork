@@ -1,3 +1,4 @@
+import copy
 import json
 from collections.abc import Callable
 from collections.abc import Generator
@@ -93,7 +94,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         prompt_config: PromptConfig,
         llm: LLM,
         fast_llm: LLM,
-        pruning_config: DocumentPruningConfig,
+        document_pruning_config: DocumentPruningConfig,
         answer_style_config: AnswerStyleConfig,
         evaluation_type: LLMEvaluationType,
         # if specified, will not actually run a search and will instead return these
@@ -156,7 +157,8 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         self.answer_style_config = answer_style_config
         self.contextual_pruning_config = (
             ContextualPruningConfig.from_doc_pruning_config(
-                num_chunk_multiple=num_chunk_multiple, doc_pruning_config=pruning_config
+                num_chunk_multiple=num_chunk_multiple,
+                doc_pruning_config=document_pruning_config,
             )
         )
 
@@ -284,6 +286,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         self, override_kwargs: SearchToolOverrideKwargs | None = None, **llm_kwargs: Any
     ) -> Generator[ToolResponse, None, None]:
         query = cast(str, llm_kwargs[QUERY_FIELD])
+        original_query = None
         precomputed_query_embedding = None
         precomputed_is_keyword = None
         precomputed_keywords = None
@@ -302,6 +305,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         kg_sources = None
         kg_chunk_id_zero_only = False
         if override_kwargs:
+            original_query = override_kwargs.original_query
+            precomputed_is_keyword = override_kwargs.precomputed_is_keyword
+            precomputed_keywords = override_kwargs.precomputed_keywords
+            precomputed_query_embedding = override_kwargs.precomputed_query_embedding
             force_no_rerank = use_alt_not_None(override_kwargs.force_no_rerank, False)
             alternate_db_session = override_kwargs.alternate_db_session
             retrieved_sections_callback = override_kwargs.retrieved_sections_callback
@@ -323,7 +330,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             yield from self._build_response_for_specified_sections(query)
             return
 
-        retrieval_options = self.retrieval_options or RetrievalDetails()
+        retrieval_options = copy.deepcopy(self.retrieval_options) or RetrievalDetails()
         if document_sources or time_cutoff:
             # if empty, just start with an empty filters object
             if not retrieval_options.filters:
@@ -341,7 +348,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 # Overwrite time-cutoff should supercede existing time-cutoff, even if defined
                 retrieval_options.filters.time_cutoff = time_cutoff
 
-        retrieval_options = retrieval_options or RetrievalDetails()
+        retrieval_options = copy.deepcopy(retrieval_options) or RetrievalDetails()
         retrieval_options.filters = retrieval_options.filters or BaseFilters()
         if kg_entities:
             retrieval_options.filters.kg_entities = kg_entities
@@ -394,6 +401,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 precomputed_keywords=precomputed_keywords,
                 # add expanded queries
                 expanded_queries=expanded_queries,
+                original_query=original_query,
             ),
             user=self.user,
             llm=self.llm,

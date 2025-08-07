@@ -4,6 +4,7 @@ from typing import cast
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import StreamWriter
+from pydantic import ValidationError
 
 from onyx.agents.agent_search.kb_search.graph_utils import get_near_empty_step_results
 from onyx.agents.agent_search.kb_search.graph_utils import stream_close_step_answer
@@ -24,16 +25,17 @@ from onyx.agents.agent_search.shared_graph_utils.utils import (
 )
 from onyx.configs.kg_configs import KG_ENTITY_EXTRACTION_TIMEOUT
 from onyx.configs.kg_configs import KG_RELATIONSHIP_EXTRACTION_TIMEOUT
-from onyx.db.engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.kg_temp_view import create_views
 from onyx.db.kg_temp_view import get_user_view_names
 from onyx.db.relationships import get_allowed_relationship_type_pairs
-from onyx.kg.extractions.extraction_processing import get_entity_types_str
-from onyx.kg.extractions.extraction_processing import get_relationship_types_str
+from onyx.kg.utils.extraction_utils import get_entity_types_str
+from onyx.kg.utils.extraction_utils import get_relationship_types_str
 from onyx.prompts.kg_prompts import QUERY_ENTITY_EXTRACTION_PROMPT
 from onyx.prompts.kg_prompts import QUERY_RELATIONSHIP_EXTRACTION_PROMPT
 from onyx.utils.logger import setup_logger
 from onyx.utils.threadpool_concurrency import run_with_timeout
+from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -79,13 +81,16 @@ def extract_ert(
     stream_write_step_activities(writer, _KG_STEP_NR)
 
     # Create temporary views. TODO: move into parallel step, if ultimately materialized
-    allowed_docs_view_name, kg_relationships_view_name = get_user_view_names(user_email)
+    tenant_id = get_current_tenant_id()
+    kg_views = get_user_view_names(user_email, tenant_id)
     with get_session_with_current_tenant() as db_session:
         create_views(
             db_session,
+            tenant_id=tenant_id,
             user_email=user_email,
-            allowed_docs_view_name=allowed_docs_view_name,
-            kg_relationships_view_name=kg_relationships_view_name,
+            allowed_docs_view_name=kg_views.allowed_docs_view_name,
+            kg_relationships_view_name=kg_views.kg_relationships_view_name,
+            kg_entity_view_name=kg_views.kg_entity_view_name,
         )
 
     ### get the entities, terms, and filters
@@ -131,25 +136,18 @@ def extract_ert(
         last_bracket = cleaned_response.rfind("}")
         cleaned_response = cleaned_response[first_bracket : last_bracket + 1]
 
-        try:
-            entity_extraction_result = (
-                KGQuestionEntityExtractionResult.model_validate_json(cleaned_response)
-            )
-        except ValueError:
-            logger.error(
-                "Failed to parse LLM response as JSON in Entity-Term Extraction"
-            )
-            entity_extraction_result = KGQuestionEntityExtractionResult(
-                entities=[],
-                terms=[],
-                time_filter="",
-            )
+        entity_extraction_result = KGQuestionEntityExtractionResult.model_validate_json(
+            cleaned_response
+        )
+    except ValidationError:
+        logger.error("Failed to parse LLM response as JSON in Entity Extraction")
+        entity_extraction_result = KGQuestionEntityExtractionResult(
+            entities=[], time_filter=""
+        )
     except Exception as e:
         logger.error(f"Error in extract_ert: {e}")
         entity_extraction_result = KGQuestionEntityExtractionResult(
-            entities=[],
-            terms=[],
-            time_filter="",
+            entities=[], time_filter=""
         )
 
     # remove the attribute filters from the entities to for the purpose of the relationship
@@ -216,9 +214,9 @@ def extract_ert(
                     cleaned_response
                 )
             )
-        except ValueError:
+        except ValidationError:
             logger.error(
-                "Failed to parse LLM response as JSON in Entity-Term Extraction"
+                "Failed to parse LLM response as JSON in Relationship Extraction"
             )
             relationship_extraction_result = KGQuestionRelationshipExtractionResult(
                 relationships=[],
@@ -253,10 +251,10 @@ Entities: {extracted_entity_string} - \n Relationships: {extracted_relationship_
         extracted_entities_w_attributes=entity_extraction_result.entities,
         extracted_entities_no_attributes=entities_no_attributes,
         extracted_relationships=relationship_extraction_result.relationships,
-        extracted_terms=entity_extraction_result.terms,
         time_filter=entity_extraction_result.time_filter,
-        kg_doc_temp_view_name=allowed_docs_view_name,
-        kg_rel_temp_view_name=kg_relationships_view_name,
+        kg_doc_temp_view_name=kg_views.allowed_docs_view_name,
+        kg_rel_temp_view_name=kg_views.kg_relationships_view_name,
+        kg_entity_temp_view_name=kg_views.kg_entity_view_name,
         log_messages=[
             get_langgraph_node_log_string(
                 graph_component="main",

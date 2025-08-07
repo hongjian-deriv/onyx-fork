@@ -1,7 +1,6 @@
 import json
 import mimetypes
 import os
-import uuid
 import zipfile
 from io import BytesIO
 from typing import Any
@@ -74,6 +73,9 @@ from onyx.db.connector import get_connector_credential_ids
 from onyx.db.connector import mark_ccpair_with_indexing_trigger
 from onyx.db.connector import update_connector
 from onyx.db.connector_credential_pair import add_credential_to_connector
+from onyx.db.connector_credential_pair import (
+    fetch_connector_credential_pair_for_connector,
+)
 from onyx.db.connector_credential_pair import get_cc_pair_groups_for_ids
 from onyx.db.connector_credential_pair import get_cc_pair_groups_for_ids_parallel
 from onyx.db.connector_credential_pair import get_connector_credential_pair
@@ -88,8 +90,7 @@ from onyx.db.credentials import delete_service_account_credentials
 from onyx.db.credentials import fetch_credential_by_id_for_user
 from onyx.db.deletion_attempt import check_deletion_attempt_is_allowed
 from onyx.db.document import get_document_counts_for_cc_pairs_parallel
-from onyx.db.engine import get_current_tenant_id
-from onyx.db.engine import get_session
+from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import AccessType
 from onyx.db.enums import IndexingMode
 from onyx.db.index_attempt import get_index_attempts_for_cc_pair
@@ -100,12 +101,9 @@ from onyx.db.models import IndexAttempt
 from onyx.db.models import IndexingStatus
 from onyx.db.models import User
 from onyx.db.models import UserGroup__ConnectorCredentialPair
-from onyx.db.search_settings import get_current_search_settings
-from onyx.db.search_settings import get_secondary_search_settings
 from onyx.file_processing.extract_file_text import convert_docx_to_txt
 from onyx.file_store.file_store import get_default_file_store
 from onyx.key_value_store.interface import KvKeyNotFoundError
-from onyx.redis.redis_connector import RedisConnector
 from onyx.server.documents.models import AuthStatus
 from onyx.server.documents.models import AuthUrl
 from onyx.server.documents.models import ConnectorCredentialPairIdentifier
@@ -130,6 +128,7 @@ from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import create_milestone_and_report
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 from onyx.utils.variable_functionality import fetch_ee_implementation_or_noop
+from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
 
@@ -419,7 +418,27 @@ def extract_zip_metadata(zf: zipfile.ZipFile) -> dict[str, Any]:
     return zip_metadata
 
 
-def upload_files(files: list[UploadFile], db_session: Session) -> FileUploadResponse:
+def is_zip_file(file: UploadFile) -> bool:
+    """
+    Check if the file is a zip file by content type or filename.
+    """
+    return bool(
+        (
+            file.content_type
+            and file.content_type.startswith(
+                (
+                    "application/zip",
+                    "application/x-zip-compressed",  # May be this in Windows
+                    "application/x-zip",
+                    "multipart/x-zip",
+                )
+            )
+        )
+        or (file.filename and file.filename.lower().endswith(".zip"))
+    )
+
+
+def upload_files(files: list[UploadFile]) -> FileUploadResponse:
     for file in files:
         if not file.filename:
             raise HTTPException(status_code=400, detail="File name cannot be empty")
@@ -430,12 +449,13 @@ def upload_files(files: list[UploadFile], db_session: Session) -> FileUploadResp
         return not any(part.startswith(".") for part in normalized_path.split(os.sep))
 
     deduped_file_paths = []
+    deduped_file_names = []
     zip_metadata = {}
     try:
-        file_store = get_default_file_store(db_session)
+        file_store = get_default_file_store()
         seen_zip = False
         for file in files:
-            if file.content_type and file.content_type.startswith("application/zip"):
+            if is_zip_file(file):
                 if seen_zip:
                     raise HTTPException(status_code=400, detail=SEEN_ZIP_DETAIL)
                 seen_zip = True
@@ -449,53 +469,58 @@ def upload_files(files: list[UploadFile], db_session: Session) -> FileUploadResp
                             continue
 
                         sub_file_bytes = zf.read(file_info)
-                        sub_file_name = os.path.join(str(uuid.uuid4()), file_info)
-                        deduped_file_paths.append(sub_file_name)
 
                         mime_type, __ = mimetypes.guess_type(file_info)
                         if mime_type is None:
                             mime_type = "application/octet-stream"
 
-                        file_store.save_file(
-                            file_name=sub_file_name,
+                        file_id = file_store.save_file(
                             content=BytesIO(sub_file_bytes),
                             display_name=os.path.basename(file_info),
                             file_origin=FileOrigin.CONNECTOR,
                             file_type=mime_type,
                         )
+                        deduped_file_paths.append(file_id)
+                        deduped_file_names.append(os.path.basename(file_info))
                 continue
+
+            # For mypy, actual check happens at start of function
+            assert file.filename is not None
 
             # Special handling for docx files - only store the plaintext version
             if file.content_type and file.content_type.startswith(
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             ):
-                file_path = convert_docx_to_txt(file, file_store)
-                deduped_file_paths.append(file_path)
+                docx_file_id = convert_docx_to_txt(file, file_store)
+                deduped_file_paths.append(docx_file_id)
+                deduped_file_names.append(file.filename)
                 continue
 
             # Default handling for all other file types
-            file_path = os.path.join(str(uuid.uuid4()), cast(str, file.filename))
-            deduped_file_paths.append(file_path)
-            file_store.save_file(
-                file_name=file_path,
+            file_id = file_store.save_file(
                 content=file.file,
                 display_name=file.filename,
                 file_origin=FileOrigin.CONNECTOR,
                 file_type=file.content_type or "text/plain",
             )
+            deduped_file_paths.append(file_id)
+            deduped_file_names.append(file.filename)
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return FileUploadResponse(file_paths=deduped_file_paths, zip_metadata=zip_metadata)
+    return FileUploadResponse(
+        file_paths=deduped_file_paths,
+        file_names=deduped_file_names,
+        zip_metadata=zip_metadata,
+    )
 
 
 @router.post("/admin/connector/file/upload")
 def upload_files_api(
     files: list[UploadFile],
     _: User = Depends(current_curator_or_admin_user),
-    db_session: Session = Depends(get_session),
 ) -> FileUploadResponse:
-    return upload_files(files, db_session)
+    return upload_files(files)
 
 
 @router.get("/admin/connector")
@@ -624,11 +649,14 @@ def get_connector_status(
     user: User = Depends(current_curator_or_admin_user),
     db_session: Session = Depends(get_session),
 ) -> list[ConnectorStatus]:
+    # This method is only used document set and group creation/editing
+    # Therefore, it is okay to get non-editable, but public cc_pairs
     cc_pairs = get_connector_credential_pairs_for_user(
         db_session=db_session,
         user=user,
         eager_load_connector=True,
         eager_load_credential=True,
+        get_editable=False,
     )
 
     group_cc_pair_relationships = get_cc_pair_groups_for_ids(
@@ -712,6 +740,9 @@ def get_connector_indexing_status(
     )
     cc_pairs = cast(list[ConnectorCredentialPair], cc_pairs)
     latest_index_attempts = cast(list[IndexAttempt], latest_index_attempts)
+    latest_finished_index_attempts = cast(
+        list[IndexAttempt], latest_finished_index_attempts
+    )
 
     cc_pair_to_latest_index_attempt = {
         (
@@ -769,12 +800,6 @@ def get_connector_indexing_status(
     for cc_pair in cc_pairs:
         connector_to_cc_pair_ids.setdefault(cc_pair.connector_id, []).append(cc_pair.id)
 
-    get_search_settings = (
-        get_secondary_search_settings
-        if secondary_index
-        else get_current_search_settings
-    )
-    search_settings = get_search_settings(db_session)
     for cc_pair in cc_pairs:
         # TODO remove this to enable ingestion API
         if cc_pair.name == "DefaultCCPair":
@@ -786,15 +811,12 @@ def get_connector_indexing_status(
             # This may happen if background deletion is happening
             continue
 
-        in_progress = False
-        if search_settings:
-            redis_connector = RedisConnector(tenant_id, cc_pair.id)
-            redis_connector_index = redis_connector.new_index(search_settings.id)
-            if redis_connector_index.fenced:
-                in_progress = True
-
         latest_index_attempt = cc_pair_to_latest_index_attempt.get(
             (connector.id, credential.id)
+        )
+        in_progress = bool(
+            latest_index_attempt
+            and latest_index_attempt.status == IndexingStatus.IN_PROGRESS
         )
 
         latest_finished_attempt = cc_pair_to_latest_finished_index_attempt.get(
@@ -892,6 +914,7 @@ def create_connector_from_model(
             target_group_ids=connector_data.groups,
             object_is_public=connector_data.access_type == AccessType.PUBLIC,
             object_is_perm_sync=connector_data.access_type == AccessType.SYNC,
+            object_is_new=True,
         )
         connector_base = connector_data.to_connector_base()
         connector_response = create_connector(
@@ -955,6 +978,7 @@ def create_connector_with_mock_credential(
         validate_ccpair_for_user(
             connector_id=connector_id,
             credential_id=credential_id,
+            access_type=connector_data.access_type,
             db_session=db_session,
         )
         response = add_credential_to_connector(
@@ -1003,6 +1027,7 @@ def update_connector_from_model(
     user: User = Depends(current_curator_or_admin_user),
     db_session: Session = Depends(get_session),
 ) -> ConnectorSnapshot | StatusResponse[int]:
+    cc_pair = fetch_connector_credential_pair_for_connector(db_session, connector_id)
     try:
         _validate_connector_allowed(connector_data.source)
         fetch_ee_implementation_or_noop(
@@ -1013,6 +1038,7 @@ def update_connector_from_model(
             target_group_ids=connector_data.groups,
             object_is_public=connector_data.access_type == AccessType.PUBLIC,
             object_is_perm_sync=connector_data.access_type == AccessType.SYNC,
+            object_is_owned_by_user=cc_pair and user and cc_pair.creator_id == user.id,
         )
         connector_base = connector_data.to_connector_base()
     except ValueError as e:
